@@ -198,6 +198,8 @@ vi.mock("../../plugins/runtime.js", () => {
 vi.mock("../../channels/plugins/index.js", () => ({
   getChannelPlugin: (channelId: string) =>
     hoisted.runtimeChannelRegistry.channels.find((entry) => entry.plugin.id === channelId)?.plugin,
+  getLoadedChannelPlugin: (channelId: string) =>
+    hoisted.runtimeChannelRegistry.channels.find((entry) => entry.plugin.id === channelId)?.plugin,
   normalizeChannelId: (raw?: string | null) => {
     const normalized = raw?.trim().toLowerCase();
     return normalized || null;
@@ -292,8 +294,8 @@ function buildSessionCommandParams(
     CommandBody: commandBody,
     CommandSource: "text",
     CommandAuthorized: true,
-    Provider: "whatsapp",
-    Surface: "whatsapp",
+    Provider: "quietchat",
+    Surface: "quietchat",
     From: "+1222",
     To: "+1222",
     SenderId: "user-1",
@@ -531,6 +533,20 @@ describe("/session idle and /session max-age", () => {
       text,
       2 * 60 * 60 * 1000,
       "2h",
+    );
+  });
+
+  it("rejects unsafe bare-hour lifecycle durations", async () => {
+    hoisted.sessionBindingResolveByConversationMock.mockReturnValue(createThreadBinding());
+
+    const result = await handleSessionCommand(
+      createThreadCommandParams("/session idle 9999999999999"),
+      true,
+    );
+
+    expect(hoisted.setThreadBindingIdleTimeoutBySessionKeyMock).not.toHaveBeenCalled();
+    expect(result?.reply?.text).toBe(
+      "Usage: /session idle <duration|off> | /session max-age <duration|off> (example: /session idle 24h)",
     );
   });
 

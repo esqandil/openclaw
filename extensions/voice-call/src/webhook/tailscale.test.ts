@@ -5,8 +5,10 @@ const { spawnMock } = vi.hoisted(() => ({
   spawnMock: vi.fn(),
 }));
 
+const tailscaleSpawnOptions = { stdio: ["ignore", "pipe", "ignore"] } as const;
+
 vi.mock("node:child_process", async () => {
-  const { mockNodeBuiltinModule } = await import("../../../../test/helpers/node-builtin-mocks.js");
+  const { mockNodeBuiltinModule } = await import("openclaw/plugin-sdk/test-node-mocks");
   return mockNodeBuiltinModule(
     () => vi.importActual<typeof import("node:child_process")>("node:child_process"),
     {
@@ -16,12 +18,14 @@ vi.mock("node:child_process", async () => {
 });
 
 import {
+  appendTailscaleCommandStdout,
   cleanupTailscaleExposure,
   cleanupTailscaleExposureRoute,
   getTailscaleDnsName,
   getTailscaleSelfInfo,
   setupTailscaleExposure,
   setupTailscaleExposureRoute,
+  TAILSCALE_COMMAND_STDOUT_MAX_BYTES,
 } from "./tailscale.js";
 
 function createProc(params?: { code?: number; stdout?: string }) {
@@ -36,6 +40,19 @@ function createProc(params?: { code?: number; stdout?: string }) {
       proc.stdout.emit("data", Buffer.from(params.stdout));
     }
     proc.emit("close", params?.code ?? 0);
+  }, 0);
+  return proc;
+}
+
+function createErrorProc() {
+  const proc = new EventEmitter() as EventEmitter & {
+    stdout: EventEmitter;
+    kill: ReturnType<typeof vi.fn>;
+  };
+  proc.stdout = new EventEmitter();
+  proc.kill = vi.fn();
+  setTimeout(() => {
+    proc.emit("error", Object.assign(new Error("spawn tailscale ENOENT"), { code: "ENOENT" }));
   }, 0);
   return proc;
 }
@@ -83,6 +100,27 @@ describe("voice-call tailscale helpers", () => {
     await expect(getTailscaleSelfInfo()).resolves.toBeNull();
   });
 
+  it("treats missing tailscale binary as unavailable instead of leaking spawn errors", async () => {
+    spawnMock.mockReturnValueOnce(createErrorProc());
+
+    await expect(getTailscaleSelfInfo()).resolves.toBeNull();
+  });
+
+  it("tracks tailscale stdout without retaining over-limit output", () => {
+    let stdout = appendTailscaleCommandStdout({ bytes: 0, exceeded: false, text: "" }, "ok", 4);
+    stdout = appendTailscaleCommandStdout(stdout, "boom", 4);
+
+    expect(stdout).toEqual({ bytes: 6, exceeded: true, text: "" });
+  });
+
+  it("kills tailscale status when stdout exceeds the capture limit", async () => {
+    const proc = createProc({ stdout: "x".repeat(TAILSCALE_COMMAND_STDOUT_MAX_BYTES + 1) });
+    spawnMock.mockReturnValueOnce(proc);
+
+    await expect(getTailscaleSelfInfo()).resolves.toBeNull();
+    expect(proc.kill).toHaveBeenCalledWith("SIGKILL");
+  });
+
   it("sets up and cleans up exposure routes with the selected mode", async () => {
     spawnMock
       .mockReturnValueOnce(
@@ -106,20 +144,20 @@ describe("voice-call tailscale helpers", () => {
     expect(spawnMock).toHaveBeenNthCalledWith(
       1,
       "tailscale",
-      ["status", "--json"],
-      expect.objectContaining({ stdio: ["ignore", "pipe", "pipe"] }),
+      ["status", "--json", "--peers=false"],
+      tailscaleSpawnOptions,
     );
     expect(spawnMock).toHaveBeenNthCalledWith(
       2,
       "tailscale",
       ["serve", "--bg", "--yes", "--set-path", "/voice", "http://127.0.0.1:8787/webhook"],
-      expect.any(Object),
+      tailscaleSpawnOptions,
     );
     expect(spawnMock).toHaveBeenNthCalledWith(
       3,
       "tailscale",
       ["serve", "off", "/voice"],
-      expect.any(Object),
+      tailscaleSpawnOptions,
     );
   });
 
@@ -183,13 +221,13 @@ describe("voice-call tailscale helpers", () => {
       2,
       "tailscale",
       ["funnel", "--bg", "--yes", "--set-path", "/voice", "http://127.0.0.1:8787/webhook"],
-      expect.any(Object),
+      tailscaleSpawnOptions,
     );
     expect(spawnMock).toHaveBeenNthCalledWith(
       3,
       "tailscale",
       ["serve", "off", "/voice"],
-      expect.any(Object),
+      tailscaleSpawnOptions,
     );
   });
 });

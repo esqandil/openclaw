@@ -1,25 +1,99 @@
-import fs from "node:fs/promises";
-import os from "node:os";
-import path from "node:path";
-import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 const refreshOpenAICodexTokenMock = vi.hoisted(() => vi.fn());
-const readOpenAICodexCliOAuthProfileMock = vi.hoisted(() => vi.fn());
+const loginOpenAICodexDeviceCodeMock = vi.hoisted(() => vi.fn());
 
 vi.mock("./openai-codex-provider.runtime.js", () => ({
   refreshOpenAICodexToken: refreshOpenAICodexTokenMock,
 }));
 
-vi.mock("./openai-codex-cli-auth.js", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("./openai-codex-cli-auth.js")>();
-  return {
-    ...actual,
-    readOpenAICodexCliOAuthProfile: readOpenAICodexCliOAuthProfileMock,
-  };
-});
+vi.mock("./openai-codex-device-code.js", () => ({
+  loginOpenAICodexDeviceCode: loginOpenAICodexDeviceCodeMock,
+}));
 
 let buildOpenAICodexProviderPlugin: typeof import("./openai-codex-provider.js").buildOpenAICodexProviderPlugin;
-const tempDirs: string[] = [];
+
+function createCodexTemplate(overrides: {
+  id?: string;
+  name?: string;
+  cost?: { input: number; output: number; cacheRead: number; cacheWrite: number };
+  contextWindow?: number;
+  contextTokens?: number;
+}) {
+  return {
+    id: overrides.id ?? "gpt-5.3-codex",
+    name: overrides.name ?? overrides.id ?? "gpt-5.3-codex",
+    provider: "openai-codex",
+    api: "openai-codex-responses",
+    baseUrl: "https://chatgpt.com/backend-api",
+    reasoning: true,
+    input: ["text", "image"] as const,
+    cost: overrides.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: overrides.contextWindow ?? 272_000,
+    ...(overrides.contextTokens === undefined ? {} : { contextTokens: overrides.contextTokens }),
+    maxTokens: 128_000,
+  };
+}
+
+function createSingleModelRegistry(
+  template: ReturnType<typeof createCodexTemplate>,
+  missValue?: null,
+) {
+  return {
+    find: (providerId: string, modelId: string) =>
+      providerId === "openai-codex" && modelId === template.id ? template : missValue,
+  };
+}
+
+type CodexProvider = ReturnType<typeof buildOpenAICodexProviderPlugin>;
+type CodexAuthMethod = NonNullable<CodexProvider["auth"]>[number];
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function requireRecord(value: unknown, label: string): Record<string, unknown> {
+  if (!isRecord(value)) {
+    throw new Error(`expected ${label} to be an object`);
+  }
+  return value;
+}
+
+function requireArray(value: unknown, label: string): unknown[] {
+  if (!Array.isArray(value)) {
+    throw new Error(`expected ${label} to be an array`);
+  }
+  return value;
+}
+
+function requireAuthMethod(provider: CodexProvider, id: string): CodexAuthMethod {
+  const method = provider.auth?.find((candidate) => candidate.id === id);
+  if (!method) {
+    throw new Error(`expected OpenAI Codex auth method ${id}`);
+  }
+  return method;
+}
+
+function expectRecordFields(value: unknown, label: string, expected: Record<string, unknown>) {
+  const record = requireRecord(value, label);
+  for (const [key, expectedValue] of Object.entries(expected)) {
+    expect(record[key]).toEqual(expectedValue);
+  }
+}
+
+function expectModelFields(model: unknown, expected: Record<string, unknown>) {
+  expectRecordFields(model, "model", expected);
+}
+
+function requireEntryById(entries: unknown, id: string): Record<string, unknown> {
+  const entry = requireArray(entries, "model catalog entries")
+    .filter(isRecord)
+    .find((candidate) => candidate.id === id);
+  if (!entry) {
+    throw new Error(`expected model catalog entry ${id}`);
+  }
+  return entry;
+}
 
 describe("openai codex provider", () => {
   beforeAll(async () => {
@@ -28,13 +102,7 @@ describe("openai codex provider", () => {
 
   beforeEach(() => {
     refreshOpenAICodexTokenMock.mockReset();
-    readOpenAICodexCliOAuthProfileMock.mockReset();
-  });
-
-  afterEach(async () => {
-    await Promise.all(
-      tempDirs.splice(0).map((dir) => fs.rm(dir, { recursive: true, force: true })),
-    );
+    loginOpenAICodexDeviceCodeMock.mockReset();
   });
 
   it("falls back to the cached credential when accountId extraction fails", async () => {
@@ -84,11 +152,41 @@ describe("openai codex provider", () => {
       expires: Date.now() + 60_000,
     });
 
-    await expect(provider.refreshOAuth?.(credential)).resolves.toEqual({
+    const refreshed = await provider.refreshOAuth?.(credential);
+
+    expect(refreshed?.expires).toBeTypeOf("number");
+    expect(refreshed).toEqual({
       ...credential,
       access: "next-access",
       refresh: "next-refresh",
-      expires: expect.any(Number),
+      expires: refreshed?.expires,
+    });
+  });
+
+  it("exposes grouped model/auth picker labels for Codex auth methods", () => {
+    const provider = buildOpenAICodexProviderPlugin();
+    const oauth = requireAuthMethod(provider, "oauth");
+    const deviceCode = requireAuthMethod(provider, "device-code");
+    const apiKey = requireAuthMethod(provider, "api-key");
+
+    expectRecordFields(oauth.wizard, "oauth wizard", {
+      choiceLabel: "ChatGPT/Codex Browser Login",
+      groupId: "openai",
+      groupLabel: "OpenAI",
+      groupHint: "ChatGPT/Codex sign-in or API key",
+    });
+    expectRecordFields(deviceCode.wizard, "device-code wizard", {
+      choiceLabel: "ChatGPT/Codex Device Pairing",
+      groupId: "openai",
+      groupLabel: "OpenAI",
+      groupHint: "ChatGPT/Codex sign-in or API key",
+    });
+    expectRecordFields(apiKey.wizard, "api-key wizard", {
+      choiceLabel: "OpenAI API Key Backup",
+      choiceHint: "Use an OpenAI API key when your Codex subscription is unavailable",
+      groupId: "openai",
+      groupLabel: "OpenAI",
+      groupHint: "ChatGPT/Codex sign-in or API key",
     });
   });
 
@@ -107,98 +205,172 @@ describe("openai codex provider", () => {
     );
   });
 
-  it("offers explicit browser and one-time Codex CLI import auth methods", () => {
+  it("declares the legacy default OAuth profile repair", () => {
     const provider = buildOpenAICodexProviderPlugin();
 
-    expect(provider.auth?.map((method) => method.id)).toEqual(["oauth", "import-codex-cli"]);
-    expect(provider.auth?.find((method) => method.id === "import-codex-cli")).toMatchObject({
-      label: "Import Codex CLI login",
-      hint: "Use existing .codex auth once",
-      kind: "oauth",
-    });
-  });
-
-  it("exposes Codex CLI auth as a runtime-only external profile", () => {
-    const provider = buildOpenAICodexProviderPlugin();
-    const credential = {
-      type: "oauth" as const,
-      provider: "openai-codex",
-      access: "access-token",
-      refresh: "refresh-token",
-      expires: Date.now() + 60_000,
-      accountId: "acct-123",
-    };
-    readOpenAICodexCliOAuthProfileMock.mockReturnValueOnce({
-      profileId: "openai-codex:default",
-      credential,
-    });
-
-    expect(
-      provider.resolveExternalAuthProfiles?.({
-        env: { CODEX_HOME: "/sandboxed/codex-home" } as NodeJS.ProcessEnv,
-        store: { version: 1, profiles: {} },
-      }),
-    ).toEqual([
+    expect(provider.oauthProfileIdRepairs).toEqual([
       {
-        profileId: "openai-codex:default",
-        credential,
-        persistence: "runtime-only",
+        legacyProfileId: "openai-codex:default",
+        promptLabel: "OpenAI Codex",
       },
     ]);
-    expect(readOpenAICodexCliOAuthProfileMock).toHaveBeenCalledWith(
-      expect.objectContaining({
-        env: expect.objectContaining({ CODEX_HOME: "/sandboxed/codex-home" }),
-        store: { version: 1, profiles: {} },
-      }),
-    );
   });
 
-  it("uses the provider auth context env when importing Codex CLI auth", async () => {
+  it("offers OpenAI menu auth methods for browser login and device pairing", () => {
     const provider = buildOpenAICodexProviderPlugin();
-    const importMethod = provider.auth?.find((method) => method.id === "import-codex-cli");
-    const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-openai-codex-provider-"));
-    tempDirs.push(agentDir);
-    readOpenAICodexCliOAuthProfileMock.mockImplementationOnce(({ env }) => {
-      expect(env).toMatchObject({
-        CODEX_HOME: "/sandboxed/codex-home",
+    const oauth = requireAuthMethod(provider, "oauth");
+    const deviceCode = requireAuthMethod(provider, "device-code");
+
+    expect(provider.auth?.map((method) => method.id)).toEqual(["oauth", "device-code", "api-key"]);
+    expect(oauth.label).toBe("ChatGPT/Codex Browser Login");
+    expect(oauth.hint).toBe("Sign in with OpenAI in your browser");
+    expectRecordFields(oauth.wizard, "oauth wizard", {
+      choiceId: "openai-codex",
+      choiceLabel: "ChatGPT/Codex Browser Login",
+      assistantPriority: -30,
+      onboardingFeatured: true,
+    });
+    expect(deviceCode.label).toBe("ChatGPT/Codex Device Pairing");
+    expect(deviceCode.hint).toBe("Pair in browser with a device code");
+    expect(deviceCode.kind).toBe("device_code");
+    expectRecordFields(deviceCode.wizard, "device-code wizard", {
+      choiceId: "openai-codex-device-code",
+      choiceLabel: "ChatGPT/Codex Device Pairing",
+      assistantPriority: -10,
+    });
+  });
+
+  it("stores device-code logins as OpenAI Codex oauth profiles", async () => {
+    const provider = buildOpenAICodexProviderPlugin();
+    const deviceCodeMethod = requireAuthMethod(provider, "device-code");
+    const note = vi.fn(async () => {});
+    const progress = { update: vi.fn(), stop: vi.fn() };
+    const runtime = {
+      log: vi.fn(),
+      error: vi.fn(),
+      exit: vi.fn(),
+    };
+    loginOpenAICodexDeviceCodeMock.mockResolvedValueOnce({
+      access:
+        "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjdC1kZXZpY2UtMTIzIn19.signature",
+      refresh: "device-refresh-token",
+      expires: Date.now() + 60_000,
+    });
+
+    const result = await deviceCodeMethod.run({
+      config: {},
+      env: process.env,
+      prompter: {
+        note,
+        progress: vi.fn(() => progress),
+      } as never,
+      runtime: runtime as never,
+      isRemote: false,
+      openUrl: async () => {},
+      oauth: { createVpsAwareHandlers: (() => ({})) as never },
+    });
+
+    expect(loginOpenAICodexDeviceCodeMock).toHaveBeenCalledOnce();
+    expect(runtime.error).not.toHaveBeenCalled();
+    expect(note).not.toHaveBeenCalledWith(
+      "Trouble with device code login? See https://docs.openclaw.ai/start/faq",
+      "OAuth help",
+    );
+    const profiles = requireArray(result?.profiles, "device-code profiles");
+    expect(profiles).toHaveLength(1);
+    const profile = requireRecord(profiles[0], "device-code profile");
+    const credential = requireRecord(profile.credential, "device-code credential");
+    expect(profile.profileId).toBe("openai-codex:default");
+    expect(credential).toEqual({
+      type: "oauth",
+      provider: "openai-codex",
+      access:
+        "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjdC1kZXZpY2UtMTIzIn19.signature",
+      refresh: "device-refresh-token",
+      expires: credential.expires,
+      accountId: "acct-device-123",
+    });
+    expect(credential.expires).toBeTypeOf("number");
+    expect(result?.defaultModel).toBe("openai/gpt-5.5");
+    expect(result?.configPatch).toEqual({
+      agents: {
+        defaults: {
+          models: {
+            "openai/gpt-5.5": {},
+          },
+        },
+      },
+    });
+    expect(result?.profiles[0]?.credential).not.toHaveProperty("idToken");
+  });
+
+  async function runRemoteDeviceCodeAuthFlow() {
+    const provider = buildOpenAICodexProviderPlugin();
+    const deviceCodeMethod = requireAuthMethod(provider, "device-code");
+    const note = vi.fn(async () => {});
+    const progress = { update: vi.fn(), stop: vi.fn() };
+    const runtime = {
+      log: vi.fn(),
+      error: vi.fn(),
+      exit: vi.fn(),
+    };
+    loginOpenAICodexDeviceCodeMock.mockImplementationOnce(async ({ onVerification }) => {
+      await onVerification({
+        verificationUrl: "https://auth.openai.com/codex/device",
+        userCode: "CODE-12345",
+        expiresInMs: 900_000,
       });
       return {
-        profileId: "openai-codex:default",
-        credential: {
-          type: "oauth",
-          provider: "openai-codex",
-          access: "access-token",
-          refresh: "refresh-token",
-          expires: Date.now() + 60_000,
-          email: "codex@example.com",
-          displayName: "Codex User",
-          accountId: "acct-123",
-        },
+        access:
+          "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9hY2NvdW50X2lkIjoiYWNjdC1kZXZpY2UtMTIzIn19.signature",
+        refresh: "device-refresh-token",
+        expires: Date.now() + 60_000,
       };
     });
 
-    await expect(
-      importMethod?.run({
-        config: {},
-        env: { CODEX_HOME: "/sandboxed/codex-home" },
-        agentDir,
-        prompter: {} as never,
-        runtime: {} as never,
-        isRemote: false,
-        openUrl: async () => {},
-        oauth: { createVpsAwareHandlers: (() => ({})) as never },
-      }),
-    ).resolves.toMatchObject({
-      profiles: [
-        {
-          profileId: "openai-codex:default",
-          credential: expect.objectContaining({
-            provider: "openai-codex",
-            access: "access-token",
-          }),
-        },
-      ],
+    const result = await deviceCodeMethod.run({
+      config: {},
+      env: process.env,
+      prompter: {
+        note,
+        progress: vi.fn(() => progress),
+      } as never,
+      runtime: runtime as never,
+      isRemote: true,
+      openUrl: async () => {},
+      oauth: { createVpsAwareHandlers: (() => ({})) as never },
     });
+
+    expect(
+      requireArray(result.profiles, "remote device-code profiles").map(
+        (profile) => requireRecord(profile, "remote device-code profile").profileId,
+      ),
+    ).toContain("openai-codex:default");
+
+    return { note, runtime };
+  }
+
+  it("surfaces the device pairing code via the prompter note in remote (SSH) mode (#74212)", async () => {
+    const { note } = await runRemoteDeviceCodeAuthFlow();
+
+    expect(note).toHaveBeenCalledWith(
+      [
+        "Open this URL in your LOCAL browser and enter the code below.",
+        "URL: https://auth.openai.com/codex/device",
+        "Code: CODE-12345",
+        "Code expires in 15 minutes. Never share it.",
+      ].join("\n"),
+      "OpenAI Codex device code",
+    );
+    expect(note).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not write the device pairing code to the runtime log in remote mode", async () => {
+    const { runtime } = await runRemoteDeviceCodeAuthFlow();
+
+    const logOutput = runtime.log.mock.calls.flat().join("\n");
+    expect(logOutput).toContain("https://auth.openai.com/codex/device");
+    expect(logOutput).not.toContain("CODE-12345");
   });
 
   it("owns native reasoning output mode for Codex responses", () => {
@@ -219,28 +391,10 @@ describe("openai codex provider", () => {
     const model = provider.resolveDynamicModel?.({
       provider: "openai-codex",
       modelId: "gpt-5.4",
-      modelRegistry: {
-        find: (providerId: string, modelId: string) => {
-          if (providerId === "openai-codex" && modelId === "gpt-5.3-codex") {
-            return {
-              id: "gpt-5.3-codex",
-              name: "gpt-5.3-codex",
-              provider: "openai-codex",
-              api: "openai-codex-responses",
-              baseUrl: "https://chatgpt.com/backend-api",
-              reasoning: true,
-              input: ["text", "image"] as const,
-              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-              contextWindow: 272_000,
-              maxTokens: 128_000,
-            };
-          }
-          return undefined;
-        },
-      } as never,
+      modelRegistry: createSingleModelRegistry(createCodexTemplate({})) as never,
     });
 
-    expect(model).toMatchObject({
+    expectModelFields(model, {
       id: "gpt-5.4",
       contextWindow: 1_050_000,
       contextTokens: 272_000,
@@ -254,33 +408,148 @@ describe("openai codex provider", () => {
     const model = provider.resolveDynamicModel?.({
       provider: "openai-codex",
       modelId: "gpt-5.4-pro",
-      modelRegistry: {
-        find: (providerId: string, modelId: string) => {
-          if (providerId === "openai-codex" && modelId === "gpt-5.3-codex") {
-            return {
-              id: "gpt-5.3-codex",
-              name: "gpt-5.3-codex",
-              provider: "openai-codex",
-              api: "openai-codex-responses",
-              baseUrl: "https://chatgpt.com/backend-api",
-              reasoning: true,
-              input: ["text", "image"] as const,
-              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-              contextWindow: 272_000,
-              maxTokens: 128_000,
-            };
-          }
-          return undefined;
-        },
-      } as never,
+      modelRegistry: createSingleModelRegistry(createCodexTemplate({})) as never,
     });
 
-    expect(model).toMatchObject({
+    expectModelFields(model, {
       id: "gpt-5.4-pro",
       contextWindow: 1_050_000,
       contextTokens: 272_000,
       maxTokens: 128_000,
       cost: { input: 30, output: 180, cacheRead: 0, cacheWrite: 0 },
+    });
+  });
+
+  it("keeps OpenClaw cost metadata but applies Codex context metadata for gpt-5.5", () => {
+    const provider = buildOpenAICodexProviderPlugin();
+
+    const model = provider.resolveDynamicModel?.({
+      provider: "openai-codex",
+      modelId: "gpt-5.5",
+      modelRegistry: createSingleModelRegistry(
+        createCodexTemplate({
+          id: "gpt-5.5",
+          cost: { input: 5, output: 30, cacheRead: 0.5, cacheWrite: 0 },
+          contextWindow: 272_000,
+        }),
+      ) as never,
+    });
+    const pro = provider.resolveDynamicModel?.({
+      provider: "openai-codex",
+      modelId: "gpt-5.5-pro",
+      modelRegistry: createSingleModelRegistry(createCodexTemplate({ id: "gpt-5.4-pro" })) as never,
+    });
+
+    expectModelFields(model, {
+      id: "gpt-5.5",
+      api: "openai-codex-responses",
+      baseUrl: "https://chatgpt.com/backend-api",
+      input: ["text", "image"],
+      contextWindow: 400_000,
+      contextTokens: 272_000,
+      maxTokens: 128_000,
+      cost: { input: 5, output: 30, cacheRead: 0.5, cacheWrite: 0 },
+    });
+    expectModelFields(pro, {
+      id: "gpt-5.5-pro",
+      api: "openai-codex-responses",
+      baseUrl: "https://chatgpt.com/backend-api",
+      contextWindow: 1_000_000,
+      contextTokens: 272_000,
+      maxTokens: 128_000,
+      cost: { input: 30, output: 180, cacheRead: 0, cacheWrite: 0 },
+    });
+  });
+
+  it("repairs sparse configured gpt-5.5 catalog rows to remain image-capable", () => {
+    const provider = buildOpenAICodexProviderPlugin();
+    const sparseConfiguredModel = {
+      id: "gpt-5.5",
+      name: "gpt-5.5",
+      provider: "openai-codex",
+      api: "openai-codex-responses",
+      baseUrl: "https://chatgpt.com/backend-api/codex",
+      reasoning: false,
+      input: ["text"] as const,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: 200_000,
+      maxTokens: 8_192,
+    };
+
+    const model = provider.resolveDynamicModel?.({
+      provider: "openai-codex",
+      modelId: "gpt-5.5",
+      modelRegistry: {
+        find: (providerId: string, modelId: string) =>
+          providerId === "openai-codex" && modelId === "gpt-5.5" ? sparseConfiguredModel : null,
+      } as never,
+    });
+
+    expectModelFields(model, {
+      id: "gpt-5.5",
+      api: "openai-codex-responses",
+      input: ["text", "image"],
+      contextWindow: 400_000,
+      contextTokens: 200_000,
+      maxTokens: 8_192,
+    });
+  });
+
+  it("synthesizes gpt-5.5 when the Codex catalog omits the OAuth row", () => {
+    const provider = buildOpenAICodexProviderPlugin();
+
+    const model = provider.resolveDynamicModel?.({
+      provider: "openai-codex",
+      modelId: "gpt-5.5",
+      modelRegistry: createSingleModelRegistry(createCodexTemplate({}), null) as never,
+    });
+
+    expectModelFields(model, {
+      id: "gpt-5.5",
+      api: "openai-codex-responses",
+      baseUrl: "https://chatgpt.com/backend-api/codex",
+      reasoning: true,
+      input: ["text", "image"],
+      contextWindow: 400_000,
+      contextTokens: 272_000,
+      maxTokens: 128_000,
+    });
+  });
+
+  it("honors providerConfig.baseUrl in the gpt-5.5 synthesis fallback", () => {
+    const provider = buildOpenAICodexProviderPlugin();
+
+    const model = provider.resolveDynamicModel?.({
+      provider: "openai-codex",
+      modelId: "gpt-5.5",
+      modelRegistry: createSingleModelRegistry(createCodexTemplate({}), null) as never,
+      providerConfig: { baseUrl: "http://proxy.local:30400" },
+    });
+
+    expectModelFields(model, {
+      id: "gpt-5.5",
+      api: "openai-codex-responses",
+      baseUrl: "http://proxy.local:30400",
+    });
+  });
+
+  it("honors providerConfig.baseUrl in the gpt-5.4 synthesis fallback", () => {
+    const provider = buildOpenAICodexProviderPlugin();
+    const emptyRegistry = { find: () => null };
+
+    const model = provider.resolveDynamicModel?.({
+      provider: "openai-codex",
+      modelId: "gpt-5.4",
+      modelRegistry: emptyRegistry as never,
+      providerConfig: { baseUrl: "http://proxy.local:30400" },
+    });
+
+    expectModelFields(model, {
+      id: "gpt-5.4",
+      api: "openai-codex-responses",
+      baseUrl: "http://proxy.local:30400",
+      contextWindow: 1_050_000,
+      maxTokens: 128_000,
     });
   });
 
@@ -290,29 +559,17 @@ describe("openai codex provider", () => {
     const model = provider.resolveDynamicModel?.({
       provider: "openai-codex",
       modelId: "gpt-5.4-pro",
-      modelRegistry: {
-        find: (providerId: string, modelId: string) => {
-          if (providerId === "openai-codex" && modelId === "gpt-5.4") {
-            return {
-              id: "gpt-5.4",
-              name: "gpt-5.4",
-              provider: "openai-codex",
-              api: "openai-codex-responses",
-              baseUrl: "https://chatgpt.com/backend-api",
-              reasoning: true,
-              input: ["text", "image"] as const,
-              cost: { input: 2.5, output: 15, cacheRead: 0.25, cacheWrite: 0 },
-              contextWindow: 1_050_000,
-              contextTokens: 272_000,
-              maxTokens: 128_000,
-            };
-          }
-          return undefined;
-        },
-      } as never,
+      modelRegistry: createSingleModelRegistry(
+        createCodexTemplate({
+          id: "gpt-5.4",
+          cost: { input: 2.5, output: 15, cacheRead: 0.25, cacheWrite: 0 },
+          contextWindow: 1_050_000,
+          contextTokens: 272_000,
+        }),
+      ) as never,
     });
 
-    expect(model).toMatchObject({
+    expectModelFields(model, {
       id: "gpt-5.4-pro",
       api: "openai-codex-responses",
       baseUrl: "https://chatgpt.com/backend-api",
@@ -329,28 +586,10 @@ describe("openai codex provider", () => {
     const model = provider.resolveDynamicModel?.({
       provider: "openai-codex",
       modelId: "gpt-5.4-codex",
-      modelRegistry: {
-        find: (providerId: string, modelId: string) => {
-          if (providerId === "openai-codex" && modelId === "gpt-5.3-codex") {
-            return {
-              id: "gpt-5.3-codex",
-              name: "gpt-5.3-codex",
-              provider: "openai-codex",
-              api: "openai-codex-responses",
-              baseUrl: "https://chatgpt.com/backend-api",
-              reasoning: true,
-              input: ["text", "image"] as const,
-              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-              contextWindow: 272_000,
-              maxTokens: 128_000,
-            };
-          }
-          return undefined;
-        },
-      } as never,
+      modelRegistry: createSingleModelRegistry(createCodexTemplate({})) as never,
     });
 
-    expect(model).toMatchObject({
+    expectModelFields(model, {
       id: "gpt-5.4",
       name: "gpt-5.4",
       contextWindow: 1_050_000,
@@ -359,43 +598,36 @@ describe("openai codex provider", () => {
     });
   });
 
-  it("resolves gpt-5.4-mini from codex templates with codex-sized limits", () => {
+  it("resolves gpt-5.4-mini through the Codex OAuth route", () => {
     const provider = buildOpenAICodexProviderPlugin();
 
     const model = provider.resolveDynamicModel?.({
       provider: "openai-codex",
       modelId: "gpt-5.4-mini",
-      modelRegistry: {
-        find: (providerId: string, modelId: string) => {
-          if (providerId === "openai-codex" && modelId === "gpt-5.1-codex-mini") {
-            return {
-              id: "gpt-5.1-codex-mini",
-              name: "gpt-5.1-codex-mini",
-              provider: "openai-codex",
-              api: "openai-codex-responses",
-              baseUrl: "https://chatgpt.com/backend-api",
-              reasoning: true,
-              input: ["text", "image"],
-              cost: { input: 0.25, output: 2, cacheRead: 0.025, cacheWrite: 0 },
-              contextWindow: 272_000,
-              maxTokens: 128_000,
-            };
-          }
-          return null;
-        },
-      } as never,
+      modelRegistry: createSingleModelRegistry(
+        createCodexTemplate({
+          id: "gpt-5.4",
+          cost: { input: 2.5, output: 15, cacheRead: 0.25, cacheWrite: 0 },
+          contextWindow: 1_050_000,
+          contextTokens: 272_000,
+        }),
+        null,
+      ) as never,
     } as never);
 
-    expect(model).toMatchObject({
+    expectModelFields(model, {
       id: "gpt-5.4-mini",
-      contextWindow: 272_000,
+      name: "gpt-5.4-mini",
+      api: "openai-codex-responses",
+      baseUrl: "https://chatgpt.com/backend-api",
+      contextWindow: 400_000,
+      contextTokens: 272_000,
       maxTokens: 128_000,
       cost: { input: 0.75, output: 4.5, cacheRead: 0.075, cacheWrite: 0 },
     });
-    expect(model).not.toHaveProperty("contextTokens");
   });
 
-  it("augments catalog with gpt-5.4 native contextWindow and runtime cap", () => {
+  it("augments catalog with gpt-5.5-pro and gpt-5.4 native metadata", () => {
     const provider = buildOpenAICodexProviderPlugin();
 
     const entries = provider.augmentModelCatalog?.({
@@ -412,29 +644,31 @@ describe("openai codex provider", () => {
       ],
     } as never);
 
-    expect(entries).toContainEqual(
-      expect.objectContaining({
-        id: "gpt-5.4",
-        contextWindow: 1_050_000,
-        contextTokens: 272_000,
-        cost: { input: 2.5, output: 15, cacheRead: 0.25, cacheWrite: 0 },
-      }),
-    );
-    expect(entries).toContainEqual(
-      expect.objectContaining({
-        id: "gpt-5.4-pro",
-        contextWindow: 1_050_000,
-        contextTokens: 272_000,
-        cost: { input: 30, output: 180, cacheRead: 0, cacheWrite: 0 },
-      }),
-    );
-    expect(entries).toContainEqual(
-      expect.objectContaining({
-        id: "gpt-5.4-mini",
-        contextWindow: 272_000,
-        cost: { input: 0.75, output: 4.5, cacheRead: 0.075, cacheWrite: 0 },
-      }),
-    );
+    expect(
+      requireArray(entries, "model catalog entries").some(
+        (entry) => isRecord(entry) && entry.id === "gpt-5.5",
+      ),
+    ).toBe(false);
+    expectRecordFields(requireEntryById(entries, "gpt-5.5-pro"), "gpt-5.5-pro entry", {
+      contextWindow: 1_000_000,
+      contextTokens: 272_000,
+      cost: { input: 30, output: 180, cacheRead: 0, cacheWrite: 0 },
+    });
+    expectRecordFields(requireEntryById(entries, "gpt-5.4"), "gpt-5.4 entry", {
+      contextWindow: 1_050_000,
+      contextTokens: 272_000,
+      cost: { input: 2.5, output: 15, cacheRead: 0.25, cacheWrite: 0 },
+    });
+    expectRecordFields(requireEntryById(entries, "gpt-5.4-pro"), "gpt-5.4-pro entry", {
+      contextWindow: 1_050_000,
+      contextTokens: 272_000,
+      cost: { input: 30, output: 180, cacheRead: 0, cacheWrite: 0 },
+    });
+    expectRecordFields(requireEntryById(entries, "gpt-5.4-mini"), "gpt-5.4-mini entry", {
+      contextWindow: 400_000,
+      contextTokens: 272_000,
+      cost: { input: 0.75, output: 4.5, cacheRead: 0.075, cacheWrite: 0 },
+    });
   });
 
   it("augments gpt-5.4-pro from catalog gpt-5.4 when legacy codex rows are absent", () => {
@@ -454,14 +688,11 @@ describe("openai codex provider", () => {
       ],
     } as never);
 
-    expect(entries).toContainEqual(
-      expect.objectContaining({
-        id: "gpt-5.4-pro",
-        contextWindow: 1_050_000,
-        contextTokens: 272_000,
-        cost: { input: 30, output: 180, cacheRead: 0, cacheWrite: 0 },
-      }),
-    );
+    expectRecordFields(requireEntryById(entries, "gpt-5.4-pro"), "gpt-5.4-pro entry", {
+      contextWindow: 1_050_000,
+      contextTokens: 272_000,
+      cost: { input: 30, output: 180, cacheRead: 0, cacheWrite: 0 },
+    });
   });
 
   it("canonicalizes legacy gpt-5.4-codex models during resolved-model normalization", () => {
@@ -484,7 +715,7 @@ describe("openai codex provider", () => {
       },
     } as never);
 
-    expect(model).toMatchObject({
+    expectModelFields(model, {
       id: "gpt-5.4",
       name: "gpt-5.4",
     });
@@ -509,9 +740,9 @@ describe("openai codex provider", () => {
       },
     } as never);
 
-    expect(model).toMatchObject({
+    expectModelFields(model, {
       api: "openai-codex-responses",
-      baseUrl: "https://chatgpt.com/backend-api",
+      baseUrl: "https://chatgpt.com/backend-api/codex",
     });
   });
 
@@ -535,10 +766,149 @@ describe("openai codex provider", () => {
       },
     } as never);
 
-    expect(model).toMatchObject({
+    expectModelFields(model, {
       api: "openai-codex-responses",
-      baseUrl: "https://chatgpt.com/backend-api",
+      baseUrl: "https://chatgpt.com/backend-api/codex",
     });
+  });
+
+  it("normalizes legacy completions metadata to the codex transport", () => {
+    const provider = buildOpenAICodexProviderPlugin();
+
+    const model = provider.normalizeResolvedModel?.({
+      provider: "openai-codex",
+      model: {
+        id: "gpt-5.4",
+        name: "gpt-5.4",
+        provider: "openai-codex",
+        api: "openai-completions",
+        baseUrl: "https://api.openai.com/v1",
+        reasoning: true,
+        input: ["text", "image"],
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        contextWindow: 1_050_000,
+        contextTokens: 272_000,
+        maxTokens: 128_000,
+      },
+    } as never);
+
+    expectModelFields(model, {
+      api: "openai-codex-responses",
+      baseUrl: "https://chatgpt.com/backend-api/codex",
+    });
+  });
+
+  it("normalizes legacy GitHub Copilot Codex metadata to the codex transport", () => {
+    const provider = buildOpenAICodexProviderPlugin();
+
+    const model = provider.normalizeResolvedModel?.({
+      provider: "openai-codex",
+      model: {
+        id: "gpt-5.4",
+        name: "gpt-5.4",
+        provider: "openai-codex",
+        api: "openai-completions",
+        baseUrl: "https://api.githubcopilot.com",
+        reasoning: true,
+        input: ["text", "image"],
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        contextWindow: 1_050_000,
+        contextTokens: 272_000,
+        maxTokens: 128_000,
+      },
+    } as never);
+
+    expectModelFields(model, {
+      api: "openai-codex-responses",
+      baseUrl: "https://chatgpt.com/backend-api/codex",
+    });
+  });
+
+  it("restores [text,image] input on stale gpt-5.5 rows that omit the input field", () => {
+    // Regression: persisted/configured catalog rows can omit the `input` field
+    // for openai-codex models. When that row wins the catalog merge,
+    // `modelSupportsInput(entry, "image")` returns false and the gateway routes
+    // inbound images down the claim-check offload path (`media://inbound/<id>`)
+    // instead of inlining them. Mirror of the Anthropic precedent set by
+    // upstream #83756.
+    const provider = buildOpenAICodexProviderPlugin();
+
+    const model = provider.normalizeResolvedModel?.({
+      provider: "openai-codex",
+      modelId: "gpt-5.5",
+      model: {
+        id: "gpt-5.5",
+        name: "gpt-5.5",
+        provider: "openai-codex",
+        api: "openai-codex-responses",
+        baseUrl: "https://chatgpt.com/backend-api/codex",
+        reasoning: true,
+        // No `input` field at all — the stale persisted/configured row shape.
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        contextWindow: 1_050_000,
+        contextTokens: 272_000,
+        maxTokens: 128_000,
+      },
+    } as never);
+
+    expect(model?.input).toEqual(["text", "image"]);
+  });
+
+  it("preserves [text,image] input on rows that already declare image capability", () => {
+    const provider = buildOpenAICodexProviderPlugin();
+
+    const model = provider.normalizeResolvedModel?.({
+      provider: "openai-codex",
+      modelId: "gpt-5.5",
+      model: {
+        id: "gpt-5.5",
+        name: "gpt-5.5",
+        provider: "openai-codex",
+        api: "openai-codex-responses",
+        baseUrl: "https://chatgpt.com/backend-api/codex",
+        reasoning: true,
+        input: ["text", "image"],
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        contextWindow: 1_050_000,
+        contextTokens: 272_000,
+        maxTokens: 128_000,
+      },
+    } as never);
+
+    // Existing image capability untouched; transport is already canonical so
+    // normalizeResolvedModel may return undefined (no-op).
+    if (model) {
+      expect(model.input).toEqual(["text", "image"]);
+    }
+  });
+
+  it("leaves codex-suffix and legacy model rows text-only (not vision-capable)", () => {
+    const provider = buildOpenAICodexProviderPlugin();
+
+    const model = provider.normalizeResolvedModel?.({
+      provider: "openai-codex",
+      modelId: "gpt-5.3-codex",
+      model: {
+        id: "gpt-5.3-codex",
+        name: "gpt-5.3-codex",
+        provider: "openai-codex",
+        api: "openai-codex-responses",
+        baseUrl: "https://chatgpt.com/backend-api/codex",
+        reasoning: true,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        contextWindow: 400_000,
+        contextTokens: 272_000,
+        maxTokens: 128_000,
+      },
+    } as never);
+
+    // No image capability should be added — gpt-5.X-codex models are
+    // Codex CLI / agent-mode only and not in the documented vision list.
+    // normalizeResolvedModel may return undefined (no transport change) or a
+    // model with the existing input array; either way `image` must not appear.
+    if (model?.input) {
+      expect(model.input).not.toContain("image");
+    }
   });
 
   it("normalizes transport metadata for stale /backend-api/v1 codex routes", () => {
@@ -552,7 +922,49 @@ describe("openai codex provider", () => {
       } as never),
     ).toEqual({
       api: "openai-codex-responses",
-      baseUrl: "https://chatgpt.com/backend-api",
+      baseUrl: "https://chatgpt.com/backend-api/codex",
     });
+  });
+
+  it("normalizes transport metadata for legacy completions codex routes", () => {
+    const provider = buildOpenAICodexProviderPlugin();
+
+    expect(
+      provider.normalizeTransport?.({
+        provider: "openai-codex",
+        api: "openai-completions",
+        baseUrl: "https://api.openai.com/v1",
+      } as never),
+    ).toEqual({
+      api: "openai-codex-responses",
+      baseUrl: "https://chatgpt.com/backend-api/codex",
+    });
+  });
+
+  it("normalizes transport metadata for legacy GitHub Copilot Codex routes", () => {
+    const provider = buildOpenAICodexProviderPlugin();
+
+    expect(
+      provider.normalizeTransport?.({
+        provider: "openai-codex",
+        api: "openai-completions",
+        baseUrl: "https://api.githubcopilot.com/v1",
+      } as never),
+    ).toEqual({
+      api: "openai-codex-responses",
+      baseUrl: "https://chatgpt.com/backend-api/codex",
+    });
+  });
+
+  it("leaves custom proxy completions transport metadata unchanged", () => {
+    const provider = buildOpenAICodexProviderPlugin();
+
+    expect(
+      provider.normalizeTransport?.({
+        provider: "openai-codex",
+        api: "openai-completions",
+        baseUrl: "https://proxy.example.com/v1",
+      } as never),
+    ).toBeUndefined();
   });
 });

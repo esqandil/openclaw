@@ -44,7 +44,7 @@ internal fun isLoopbackGatewayHost(
   return isMappedIpv4 && address[12] == 127.toByte()
 }
 
-internal fun isPrivateLanGatewayHost(
+internal fun isLocalCleartextGatewayHost(
   rawHost: String?,
   allowEmulatorBridgeAlias: Boolean = isAndroidEmulatorRuntime(),
 ): Boolean {
@@ -63,8 +63,6 @@ internal fun isPrivateLanGatewayHost(
   }
   if (host.isEmpty()) return false
   if (isLoopbackGatewayHost(host, allowEmulatorBridgeAlias = allowEmulatorBridgeAlias)) return true
-  if (host.endsWith(".local")) return true
-  if (!host.contains('.') && !host.contains(':')) return true
 
   parseIpv4Address(host)?.let { ipv4 ->
     val first = ipv4[0].toInt() and 0xff

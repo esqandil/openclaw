@@ -1,24 +1,13 @@
-import { listAgentIds, resolveDefaultAgentId } from "../../agents/agent-scope.js";
-import { listChatCommandsForConfig } from "../../auto-reply/commands-registry.js";
 import type {
-  ChatCommandDefinition,
-  CommandArgChoice,
-  CommandArgDefinition,
-} from "../../auto-reply/commands-registry.types.js";
-import { listSkillCommandsForAgents } from "../../auto-reply/skill-commands.js";
-import { getChannelPlugin } from "../../channels/plugins/index.js";
-import { loadConfig } from "../../config/config.js";
-import type { OpenClawConfig } from "../../config/types.openclaw.js";
-import { getPluginCommandSpecs } from "../../plugins/command-registry-state.js";
-import { listPluginCommands } from "../../plugins/commands.js";
-import { normalizeOptionalLowercaseString } from "../../shared/string-coerce.js";
-import type { CommandEntry, CommandsListResult } from "../protocol/index.js";
+  CommandEntry,
+  CommandsListResult,
+} from "../../../packages/gateway-protocol/src/index.js";
 import {
   ErrorCodes,
   errorShape,
   formatValidationErrors,
   validateCommandsListParams,
-} from "../protocol/index.js";
+} from "../../../packages/gateway-protocol/src/index.js";
 import {
   COMMAND_ALIAS_MAX_ITEMS,
   COMMAND_ARG_CHOICES_MAX_ITEMS,
@@ -30,7 +19,20 @@ import {
   COMMAND_DESCRIPTION_MAX_LENGTH,
   COMMAND_LIST_MAX_ITEMS,
   COMMAND_NAME_MAX_LENGTH,
-} from "../protocol/schema/commands.js";
+} from "../../../packages/gateway-protocol/src/schema.js";
+import { listAgentIds, resolveDefaultAgentId } from "../../agents/agent-scope.js";
+import { listChatCommandsForConfig } from "../../auto-reply/commands-registry.js";
+import type {
+  ChatCommandDefinition,
+  CommandArgChoice,
+  CommandArgDefinition,
+} from "../../auto-reply/commands-registry.types.js";
+import { listSkillCommandsForAgents } from "../../auto-reply/skill-commands.js";
+import { getChannelPlugin } from "../../channels/plugins/index.js";
+import type { OpenClawConfig } from "../../config/types.openclaw.js";
+import { getPluginCommandSpecs } from "../../plugins/command-specs.js";
+import { listPluginCommands } from "../../plugins/commands.js";
+import { normalizeOptionalLowercaseString } from "../../shared/string-coerce.js";
 import type { GatewayRequestHandlers, RespondFn } from "./types.js";
 
 type SerializedArg = NonNullable<CommandEntry["args"]>[number];
@@ -52,8 +54,11 @@ function clampDescription(value: string | undefined): string {
   return clampString(value ?? "", COMMAND_DESCRIPTION_MAX_LENGTH);
 }
 
-function resolveAgentIdOrRespondError(rawAgentId: unknown, respond: RespondFn) {
-  const cfg = loadConfig();
+function resolveAgentIdOrRespondError(
+  rawAgentId: unknown,
+  respond: RespondFn,
+  cfg: OpenClawConfig,
+) {
   const knownAgents = listAgentIds(cfg);
   const requestedAgentId = typeof rawAgentId === "string" ? rawAgentId.trim() : "";
   const agentId = requestedAgentId || resolveDefaultAgentId(cfg);
@@ -172,9 +177,10 @@ function mapCommand(
 function buildPluginCommandEntries(params: {
   provider?: string;
   nameSurface: CommandNameSurface;
+  cfg: OpenClawConfig;
 }): CommandEntry[] {
   const pluginTextSpecs = listPluginCommands();
-  const pluginNativeSpecs = getPluginCommandSpecs(params.provider);
+  const pluginNativeSpecs = getPluginCommandSpecs(params.provider, { config: params.cfg });
   const entries: CommandEntry[] = [];
 
   for (const [index, textSpec] of pluginTextSpecs.entries()) {
@@ -233,13 +239,13 @@ export function buildCommandsListResult(params: {
     );
   }
 
-  commands.push(...buildPluginCommandEntries({ provider, nameSurface }));
+  commands.push(...buildPluginCommandEntries({ provider, nameSurface, cfg: params.cfg }));
 
   return { commands: commands.slice(0, COMMAND_LIST_MAX_ITEMS) };
 }
 
 export const commandsHandlers: GatewayRequestHandlers = {
-  "commands.list": ({ params, respond }) => {
+  "commands.list": ({ params, respond, context }) => {
     if (!validateCommandsListParams(params)) {
       respond(
         false,
@@ -251,7 +257,11 @@ export const commandsHandlers: GatewayRequestHandlers = {
       );
       return;
     }
-    const resolved = resolveAgentIdOrRespondError(params.agentId, respond);
+    const resolved = resolveAgentIdOrRespondError(
+      params.agentId,
+      respond,
+      context.getRuntimeConfig(),
+    );
     if (!resolved) {
       return;
     }

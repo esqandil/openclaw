@@ -1,16 +1,18 @@
-import { createSubsystemLogger } from "../logging/subsystem.js";
 import {
   hasSensitiveUrlHintTag,
   isSensitiveUrlConfigPath,
   redactSensitiveUrlLikeString,
-} from "../shared/net/redact-sensitive-url.js";
+} from "@openclaw/net-policy/redact-sensitive-url";
+import { createSubsystemLogger } from "../logging/subsystem.js";
+import { type ConfigUiHints } from "../shared/config-ui-hints-types.js";
+import { isRecord as isObjectRecord } from "../shared/record-coerce.js";
 import { normalizeLowercaseStringOrEmpty } from "../shared/string-coerce.js";
 import {
   replaceSensitiveValuesInRaw,
   shouldFallbackToStructuredRawRedaction,
 } from "./redact-snapshot.raw.js";
 import { isSecretRefShape, redactSecretRefId } from "./redact-snapshot.secret-ref.js";
-import { isSensitiveConfigPath, type ConfigUiHints } from "./schema.hints.js";
+import { isSensitiveConfigPath } from "./sensitive-paths.js";
 import type { ConfigFileSnapshot } from "./types.openclaw.js";
 
 const log = createSubsystemLogger("config/redaction");
@@ -19,9 +21,8 @@ const ENV_VAR_PLACEHOLDER_PATTERN = /^\$\{[^}]*\}$/;
 function isSensitivePath(path: string): boolean {
   if (path.endsWith("[]")) {
     return isSensitiveConfigPath(path.slice(0, -2));
-  } else {
-    return isSensitiveConfigPath(path);
   }
+  return isSensitiveConfigPath(path);
 }
 
 function isEnvVarPlaceholder(value: string): boolean {
@@ -42,10 +43,6 @@ function hasSensitiveUrlHintPath(hints: ConfigUiHints | undefined, paths: string
     return false;
   }
   return paths.some((path) => hasSensitiveUrlHintTag(hints[path]));
-}
-
-function isObjectRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function collectSensitiveStrings(value: unknown, values: string[]): void {
@@ -146,9 +143,8 @@ function redactObject(obj: unknown, hints?: ConfigUiHints): unknown {
     return lookup.has("")
       ? redactObjectWithLookup(obj, lookup, "", [], hints)
       : redactObjectGuessing(obj, "", [], hints);
-  } else {
-    return redactObjectGuessing(obj, "", []);
   }
+  return redactObjectGuessing(obj, "", []);
 }
 
 /**
@@ -456,9 +452,13 @@ export function redactConfigSnapshot(
   }
   // Also redact the resolved config (contains values after ${ENV} substitution)
   const redactedResolved = redactConfigObject(snapshot.resolved, uiHints);
+  const { pluginMetadataSnapshot: _pluginMetadataSnapshot, ...publicSnapshot } =
+    snapshot as typeof snapshot & {
+      pluginMetadataSnapshot?: unknown;
+    };
 
   return {
-    ...snapshot,
+    ...publicSnapshot,
     sourceConfig: redactedResolved,
     runtimeConfig: redactedConfig,
     config: redactedConfig,
@@ -468,7 +468,7 @@ export function redactConfigSnapshot(
   };
 }
 
-export type RedactionResult = {
+type RedactionResult = {
   ok: boolean;
   result?: unknown;
   error?: unknown;

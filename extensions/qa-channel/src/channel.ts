@@ -1,7 +1,12 @@
 import {
   buildChannelOutboundSessionRoute,
+  buildThreadAwareOutboundSessionRoute,
   createChatChannelPlugin,
 } from "openclaw/plugin-sdk/channel-core";
+import {
+  createMessageReceiptFromOutboundResults,
+  defineChannelMessageAdapter,
+} from "openclaw/plugin-sdk/channel-outbound";
 import { getChatChannelMeta } from "openclaw/plugin-sdk/channel-plugin-common";
 import {
   DEFAULT_ACCOUNT_ID,
@@ -20,7 +25,49 @@ import { qaChannelStatus } from "./status.js";
 import type { CoreConfig, ResolvedQaChannelAccount } from "./types.js";
 
 const CHANNEL_ID = "qa-channel" as const;
-const meta = { ...getChatChannelMeta(CHANNEL_ID) };
+const meta = {
+  ...getChatChannelMeta(CHANNEL_ID),
+  id: CHANNEL_ID,
+  label: "QA Channel",
+  selectionLabel: "QA Channel",
+  docsPath: "/channels/qa-channel",
+  blurb: "Synthetic QA channel for OpenClaw QA runs.",
+};
+
+const qaChannelMessageAdapter = defineChannelMessageAdapter({
+  id: CHANNEL_ID,
+  durableFinal: {
+    capabilities: {
+      text: true,
+      replyTo: true,
+      thread: true,
+      messageSendingHooks: true,
+    },
+  },
+  send: {
+    text: async (ctx) => {
+      const result = await sendQaChannelText({
+        cfg: ctx.cfg as CoreConfig,
+        accountId: ctx.accountId,
+        to: ctx.to,
+        text: ctx.text,
+        threadId: ctx.threadId,
+        replyToId: ctx.replyToId,
+      });
+      const threadId = ctx.threadId == null ? undefined : String(ctx.threadId);
+      const replyToId = ctx.replyToId ?? undefined;
+      return {
+        messageId: result.messageId,
+        receipt: createMessageReceiptFromOutboundResults({
+          results: [{ channel: CHANNEL_ID, messageId: result.messageId }],
+          threadId,
+          replyToId,
+          kind: "text",
+        }),
+      };
+    },
+  },
+});
 
 export const qaChannelPlugin: ChannelPlugin<ResolvedQaChannelAccount> = createChatChannelPlugin({
   base: {
@@ -52,36 +99,60 @@ export const qaChannelPlugin: ChannelPlugin<ResolvedQaChannelAccount> = createCh
     },
     messaging: {
       normalizeTarget: normalizeQaTarget,
-      parseExplicitTarget: ({ raw }) => {
-        const parsed = parseQaTarget(raw);
-        return {
-          to: buildQaTarget(parsed),
-          threadId: parsed.threadId,
-          chatType: parsed.chatType,
-        };
-      },
       inferTargetChatType: ({ to }) => parseQaTarget(to).chatType,
       targetResolver: {
         looksLikeId: (raw) =>
-          /^((dm|channel):|thread:[^/]+\/)/i.test(raw.trim()) || raw.trim().length > 0,
-        hint: "<dm:user|channel:room|thread:room/thread>",
+          /^((dm|channel|group):|thread:[^/]+\/)/i.test(raw.trim()) || raw.trim().length > 0,
+        hint: "<dm:user|channel:room|group:room|thread:room/thread>",
       },
-      resolveOutboundSessionRoute: ({ cfg, agentId, accountId, target, threadId }) => {
+      resolveOutboundSessionRoute: ({
+        cfg,
+        agentId,
+        accountId,
+        target,
+        replyToId,
+        threadId,
+        currentSessionKey,
+      }) => {
         const parsed = parseQaTarget(target);
-        return buildChannelOutboundSessionRoute({
+        const baseRoute = buildChannelOutboundSessionRoute({
           cfg,
           agentId,
           channel: CHANNEL_ID,
           accountId,
           peer: {
-            kind: parsed.chatType === "direct" ? "direct" : "channel",
+            kind:
+              parsed.chatType === "direct"
+                ? "direct"
+                : parsed.chatType === "group"
+                  ? "group"
+                  : "channel",
             id: buildQaTarget(parsed),
           },
           chatType: parsed.chatType,
           from: `qa-channel:${accountId ?? DEFAULT_ACCOUNT_ID}`,
           to: buildQaTarget(parsed),
-          threadId: threadId ?? parsed.threadId,
         });
+        return buildThreadAwareOutboundSessionRoute({
+          route: baseRoute,
+          replyToId,
+          threadId: threadId ?? (target.trim().startsWith("thread:") ? undefined : parsed.threadId),
+          currentSessionKey,
+          canRecoverCurrentThread: ({ route }) =>
+            route.chatType !== "direct" || (cfg.session?.dmScope ?? "main") !== "main",
+        });
+      },
+      resolveSessionConversation: ({ rawId }) => {
+        const parsed = parseQaTarget(rawId);
+        if (parsed.chatType === "direct") {
+          return null;
+        }
+        return {
+          id: parsed.conversationId,
+          threadId: parsed.threadId,
+          baseConversationId: parsed.conversationId,
+          parentConversationCandidates: [parsed.conversationId],
+        };
       },
     },
     status: qaChannelStatus,
@@ -91,6 +162,7 @@ export const qaChannelPlugin: ChannelPlugin<ResolvedQaChannelAccount> = createCh
       },
     },
     actions: qaChannelMessageActions,
+    message: qaChannelMessageAdapter,
   },
   outbound: {
     base: {

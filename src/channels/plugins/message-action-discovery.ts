@@ -1,8 +1,9 @@
-import type { TSchema } from "@sinclair/typebox";
+import type { TSchema } from "typebox";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { formatErrorMessage } from "../../infra/errors.js";
 import { defaultRuntime } from "../../runtime.js";
 import { normalizeOptionalString } from "../../shared/string-coerce.js";
+import { uniqueStrings } from "../../shared/string-normalization.js";
 import { normalizeAnyChannelId } from "../registry.js";
 import { getChannelPlugin, getLoadedChannelPlugin, listChannelPlugins } from "./index.js";
 import type { ChannelMessageCapability } from "./message-capabilities.js";
@@ -30,6 +31,14 @@ export type ChannelMessageActionDiscoveryInput = {
   agentId?: string | null;
   requesterSenderId?: string | null;
   senderIsOwner?: boolean;
+};
+
+type ChannelMessageActionDiscoveryParams = ChannelMessageActionDiscoveryInput & {
+  cfg: OpenClawConfig;
+};
+
+type ChannelMessageToolMediaSourceParamKeyInput = ChannelMessageActionDiscoveryParams & {
+  action?: ChannelMessageActionName;
 };
 
 const loggedMessageActionErrors = new Set<string>();
@@ -135,7 +144,7 @@ function normalizeMessageToolMediaSourceParams(
   );
 }
 
-export function resolveCurrentChannelMessageToolDiscoveryAdapter(channel?: string): {
+export function resolveCurrentChannelMessageToolDiscoveryAdapter(channel?: string | null): {
   pluginId: string;
   actions: ChannelMessageToolDiscoveryAdapter;
 } | null {
@@ -223,6 +232,48 @@ export function listChannelMessageActions(cfg: OpenClawConfig): ChannelMessageAc
   return Array.from(actions);
 }
 
+export function listCrossChannelSchemaSupportedMessageActions(
+  params: ChannelMessageActionDiscoveryParams & {
+    channel?: string;
+  },
+): ChannelMessageActionName[] {
+  const channelId = resolveMessageActionDiscoveryChannelId(params.channel);
+  if (!channelId) {
+    return [];
+  }
+  const pluginActions = resolveCurrentChannelMessageToolDiscoveryAdapter(channelId);
+  if (!pluginActions?.actions) {
+    return [];
+  }
+  const resolved = resolveMessageActionDiscoveryForPlugin({
+    pluginId: pluginActions.pluginId,
+    actions: pluginActions.actions,
+    context: createMessageActionDiscoveryContext(params),
+    includeActions: true,
+    includeSchema: true,
+  });
+  const schemaBlockedActions = new Set<ChannelMessageActionName>();
+  for (const contribution of resolved.schemaContributions) {
+    if ((contribution.visibility ?? "current-channel") !== "current-channel") {
+      continue;
+    }
+    if (!Object.hasOwn(contribution, "actions")) {
+      return [];
+    }
+    const actions = contribution.actions;
+    if (!Array.isArray(actions)) {
+      return [];
+    }
+    if (actions.length === 0) {
+      continue;
+    }
+    for (const action of actions) {
+      schemaBlockedActions.add(action);
+    }
+  }
+  return resolved.actions.filter((action) => !schemaBlockedActions.has(action));
+}
+
 export function listChannelMessageCapabilities(cfg: OpenClawConfig): ChannelMessageCapability[] {
   const capabilities = new Set<ChannelMessageCapability>();
   for (const plugin of listChannelPlugins()) {
@@ -238,19 +289,9 @@ export function listChannelMessageCapabilities(cfg: OpenClawConfig): ChannelMess
   return Array.from(capabilities);
 }
 
-export function listChannelMessageCapabilitiesForChannel(params: {
-  cfg: OpenClawConfig;
-  channel?: string;
-  currentChannelId?: string | null;
-  currentThreadTs?: string | null;
-  currentMessageId?: string | number | null;
-  accountId?: string | null;
-  sessionKey?: string | null;
-  sessionId?: string | null;
-  agentId?: string | null;
-  requesterSenderId?: string | null;
-  senderIsOwner?: boolean;
-}): ChannelMessageCapability[] {
+export function listChannelMessageCapabilitiesForChannel(
+  params: ChannelMessageActionDiscoveryParams,
+): ChannelMessageCapability[] {
   const pluginActions = resolveCurrentChannelMessageToolDiscoveryAdapter(params.channel);
   if (!pluginActions) {
     return [];
@@ -279,19 +320,9 @@ function mergeToolSchemaProperties(
   }
 }
 
-export function resolveChannelMessageToolSchemaProperties(params: {
-  cfg: OpenClawConfig;
-  channel?: string;
-  currentChannelId?: string | null;
-  currentThreadTs?: string | null;
-  currentMessageId?: string | number | null;
-  accountId?: string | null;
-  sessionKey?: string | null;
-  sessionId?: string | null;
-  agentId?: string | null;
-  requesterSenderId?: string | null;
-  senderIsOwner?: boolean;
-}): Record<string, TSchema> {
+export function resolveChannelMessageToolSchemaProperties(
+  params: ChannelMessageActionDiscoveryParams,
+): Record<string, TSchema> {
   const properties: Record<string, TSchema> = {};
   const currentChannel = resolveMessageActionDiscoveryChannelId(params.channel);
   const discoveryBase = createMessageActionDiscoveryContext(params);
@@ -338,20 +369,9 @@ export function resolveChannelMessageToolSchemaProperties(params: {
   return properties;
 }
 
-export function resolveChannelMessageToolMediaSourceParamKeys(params: {
-  cfg: OpenClawConfig;
-  action?: ChannelMessageActionName;
-  channel?: string;
-  currentChannelId?: string | null;
-  currentThreadTs?: string | null;
-  currentMessageId?: string | number | null;
-  accountId?: string | null;
-  sessionKey?: string | null;
-  sessionId?: string | null;
-  agentId?: string | null;
-  requesterSenderId?: string | null;
-  senderIsOwner?: boolean;
-}): string[] {
+export function resolveChannelMessageToolMediaSourceParamKeys(
+  params: ChannelMessageToolMediaSourceParamKeyInput,
+): string[] {
   const pluginActions = resolveCurrentChannelMessageToolDiscoveryAdapter(params.channel);
   if (!pluginActions) {
     return [];
@@ -363,7 +383,7 @@ export function resolveChannelMessageToolMediaSourceParamKeys(params: {
     action: params.action,
     includeSchema: false,
   });
-  return Array.from(new Set(described.mediaSourceParams));
+  return uniqueStrings(described.mediaSourceParams);
 }
 
 export function channelSupportsMessageCapability(
@@ -374,25 +394,15 @@ export function channelSupportsMessageCapability(
 }
 
 export function channelSupportsMessageCapabilityForChannel(
-  params: {
-    cfg: OpenClawConfig;
-    channel?: string;
-    currentChannelId?: string | null;
-    currentThreadTs?: string | null;
-    currentMessageId?: string | number | null;
-    accountId?: string | null;
-    sessionKey?: string | null;
-    sessionId?: string | null;
-    agentId?: string | null;
-    requesterSenderId?: string | null;
-  },
+  params: ChannelMessageActionDiscoveryParams,
   capability: ChannelMessageCapability,
 ): boolean {
   return listChannelMessageCapabilitiesForChannel(params).includes(capability);
 }
 
-export const __testing = {
+export const testing = {
   resetLoggedMessageActionErrors() {
     loggedMessageActionErrors.clear();
   },
 };
+export { testing as __testing };

@@ -1,6 +1,7 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { pluginSdkSubpaths } from "../../scripts/lib/plugin-sdk-entries.mjs";
+import privateLocalOnlyPluginSdkSubpaths from "../../scripts/lib/plugin-sdk-private-local-only-subpaths.json" with { type: "json" };
 import {
   detectVitestHostInfo as detectVitestHostInfoImpl,
   isCiLikeEnv,
@@ -76,7 +77,46 @@ const localScheduling = resolveLocalVitestScheduling(
   detectVitestHostInfo(),
   defaultPool,
 );
-const ciWorkers = isWindows ? 2 : 3;
+
+function hasWorkerOverride(env: Record<string, string | undefined>): boolean {
+  return Boolean((env.OPENCLAW_VITEST_MAX_WORKERS ?? env.OPENCLAW_TEST_WORKERS)?.trim());
+}
+
+export function resolveSharedVitestWorkerConfig(params: {
+  env?: Record<string, string | undefined>;
+  isCI?: boolean;
+  isWindows?: boolean;
+  localScheduling?: LocalVitestScheduling;
+}): Pick<LocalVitestScheduling, "fileParallelism" | "maxWorkers"> {
+  const env = params.env ?? process.env;
+  const local = params.localScheduling ?? localScheduling;
+  if (hasWorkerOverride(env)) {
+    return {
+      fileParallelism: local.fileParallelism,
+      maxWorkers: local.maxWorkers,
+    };
+  }
+  if (params.isCI ?? isCI) {
+    return {
+      fileParallelism: true,
+      maxWorkers: (params.isWindows ?? isWindows) ? 2 : 3,
+    };
+  }
+  return {
+    fileParallelism: local.fileParallelism,
+    maxWorkers: local.maxWorkers,
+  };
+}
+
+const workerConfig = resolveSharedVitestWorkerConfig({
+  env: process.env,
+  isCI,
+  isWindows,
+  localScheduling,
+});
+const sourcePluginSdkSubpaths = [
+  ...new Set([...pluginSdkSubpaths, ...privateLocalOnlyPluginSdkSubpaths]),
+].toSorted((left, right) => left.localeCompare(right));
 
 if (!isCI && localScheduling.throttledBySystem && shouldPrintVitestThrottle(process.env)) {
   console.error(
@@ -92,10 +132,122 @@ export const sharedVitestConfig = {
   resolve: {
     alias: [
       {
+        find: "discord-api-types/v10",
+        replacement: path.join(repoRoot, "test", "vitest", "discord-api-types-v10-runtime.ts"),
+      },
+      {
+        find: "discord-api-types/gateway/v10",
+        replacement: path.join(
+          repoRoot,
+          "test",
+          "vitest",
+          "discord-api-types-gateway-v10-runtime.ts",
+        ),
+      },
+      {
+        find: "discord-api-types/payloads/v10",
+        replacement: path.join(
+          repoRoot,
+          "test",
+          "vitest",
+          "discord-api-types-payloads-v10-runtime.ts",
+        ),
+      },
+      {
         find: "openclaw/extension-api",
         replacement: path.join(repoRoot, "src", "extensionAPI.ts"),
       },
-      ...pluginSdkSubpaths.map((subpath) => ({
+      {
+        find: "@openclaw/qa-channel/api.js",
+        replacement: path.join(repoRoot, "extensions", "qa-channel", "api.ts"),
+      },
+      {
+        find: "@openclaw/discord/api.js",
+        replacement: path.join(repoRoot, "extensions", "discord", "api.ts"),
+      },
+      {
+        find: "@openclaw/slack/api.js",
+        replacement: path.join(repoRoot, "extensions", "slack", "api.ts"),
+      },
+      {
+        find: "@openclaw/whatsapp/api.js",
+        replacement: path.join(repoRoot, "extensions", "whatsapp", "api.ts"),
+      },
+      {
+        find: "@openclaw/gateway-client/readiness",
+        replacement: path.join(repoRoot, "packages", "gateway-client", "src", "readiness.ts"),
+      },
+      {
+        find: "@openclaw/gateway-client/timeouts",
+        replacement: path.join(repoRoot, "packages", "gateway-client", "src", "timeouts.ts"),
+      },
+      {
+        find: "@openclaw/gateway-client",
+        replacement: path.join(repoRoot, "packages", "gateway-client", "src", "index.ts"),
+      },
+      {
+        find: "@openclaw/gateway-protocol/client-info",
+        replacement: path.join(repoRoot, "packages", "gateway-protocol", "src", "client-info.ts"),
+      },
+      {
+        find: "@openclaw/gateway-protocol/connect-error-details",
+        replacement: path.join(
+          repoRoot,
+          "packages",
+          "gateway-protocol",
+          "src",
+          "connect-error-details.ts",
+        ),
+      },
+      {
+        find: "@openclaw/gateway-protocol/schema",
+        replacement: path.join(repoRoot, "packages", "gateway-protocol", "src", "schema.ts"),
+      },
+      {
+        find: "@openclaw/gateway-protocol/startup-unavailable",
+        replacement: path.join(
+          repoRoot,
+          "packages",
+          "gateway-protocol",
+          "src",
+          "startup-unavailable.ts",
+        ),
+      },
+      {
+        find: "@openclaw/gateway-protocol/version",
+        replacement: path.join(repoRoot, "packages", "gateway-protocol", "src", "version.ts"),
+      },
+      {
+        find: "@openclaw/gateway-protocol",
+        replacement: path.join(repoRoot, "packages", "gateway-protocol", "src", "index.ts"),
+      },
+      {
+        find: "@openclaw/net-policy/ip",
+        replacement: path.join(repoRoot, "packages", "net-policy", "src", "ip.ts"),
+      },
+      {
+        find: "@openclaw/net-policy/ipv4",
+        replacement: path.join(repoRoot, "packages", "net-policy", "src", "ipv4.ts"),
+      },
+      {
+        find: "@openclaw/net-policy/redact-sensitive-url",
+        replacement: path.join(
+          repoRoot,
+          "packages",
+          "net-policy",
+          "src",
+          "redact-sensitive-url.ts",
+        ),
+      },
+      {
+        find: "@openclaw/net-policy/url-userinfo",
+        replacement: path.join(repoRoot, "packages", "net-policy", "src", "url-userinfo.ts"),
+      },
+      {
+        find: "@openclaw/net-policy",
+        replacement: path.join(repoRoot, "packages", "net-policy", "src", "index.ts"),
+      },
+      ...sourcePluginSdkSubpaths.map((subpath) => ({
         find: `openclaw/plugin-sdk/${subpath}`,
         replacement: path.join(repoRoot, "src", "plugin-sdk", `${subpath}.ts`),
       })),
@@ -118,8 +270,8 @@ export const sharedVitestConfig = {
     isolate: false,
     pool: defaultPool,
     runner: nonIsolatedRunnerPath,
-    maxWorkers: isCI ? ciWorkers : localScheduling.maxWorkers,
-    fileParallelism: isCI ? true : localScheduling.fileParallelism,
+    maxWorkers: workerConfig.maxWorkers,
+    fileParallelism: workerConfig.fileParallelism,
     forceRerunTriggers: [
       "package.json",
       "pnpm-lock.yaml",
@@ -128,27 +280,44 @@ export const sharedVitestConfig = {
       "test/setup.extensions.ts",
       "test/setup-openclaw-runtime.ts",
       "test/vitest/vitest.channel-paths.mjs",
+      "test/vitest/vitest.agents-paths.mjs",
+      "test/vitest/vitest.agents-core.config.ts",
+      "test/vitest/vitest.agents-embedded-agent.config.ts",
+      "test/vitest/vitest.agents-support.config.ts",
+      "test/vitest/vitest.agents-tools.config.ts",
       "test/vitest/vitest.channels.config.ts",
       "test/vitest/vitest.acp.config.ts",
       "test/vitest/vitest.boundary.config.ts",
       "test/vitest/vitest.bundled.config.ts",
       "test/vitest/vitest.cli.config.ts",
       "vitest.config.ts",
-      "test/vitest/vitest.contracts.config.ts",
+      "test/vitest/vitest.contracts-shared.ts",
+      "test/vitest/vitest.contracts-channel-surface.config.ts",
+      "test/vitest/vitest.contracts-channel-config.config.ts",
+      "test/vitest/vitest.contracts-channel-registry.config.ts",
+      "test/vitest/vitest.contracts-channel-session.config.ts",
+      "test/vitest/vitest.contracts-plugin.config.ts",
       "test/vitest/vitest.cron.config.ts",
       "test/vitest/vitest.daemon.config.ts",
       "test/vitest/vitest.e2e.config.ts",
       "test/vitest/vitest.extension-acpx-paths.mjs",
       "test/vitest/vitest.extension-acpx.config.ts",
-      "test/vitest/vitest.extension-bluebubbles-paths.mjs",
-      "test/vitest/vitest.extension-bluebubbles.config.ts",
+      "test/vitest/vitest.extension-channel-single-config.ts",
+      "test/vitest/vitest.extension-channel-split-paths.mjs",
       "test/vitest/vitest.extension-channels.config.ts",
       "test/vitest/vitest.extension-diffs-paths.mjs",
       "test/vitest/vitest.extension-diffs.config.ts",
+      "test/vitest/vitest.extension-discord.config.ts",
+      "test/vitest/vitest.extension-active-memory-paths.mjs",
+      "test/vitest/vitest.extension-active-memory.config.ts",
+      "test/vitest/vitest.extension-codex-paths.mjs",
+      "test/vitest/vitest.extension-codex.config.ts",
       "test/vitest/vitest.extension-feishu-paths.mjs",
       "test/vitest/vitest.extension-feishu.config.ts",
+      "test/vitest/vitest.extension-imessage.config.ts",
       "test/vitest/vitest.extension-irc-paths.mjs",
       "test/vitest/vitest.extension-irc.config.ts",
+      "test/vitest/vitest.extension-line.config.ts",
       "test/vitest/vitest.extension-mattermost-paths.mjs",
       "test/vitest/vitest.extension-mattermost.config.ts",
       "test/vitest/vitest.extension-matrix-paths.mjs",
@@ -176,6 +345,7 @@ export const sharedVitestConfig = {
       "test/vitest/vitest.scoped-config.ts",
       "test/vitest/vitest.shared-core.config.ts",
       "test/vitest/vitest.shared.config.ts",
+      "test/vitest/vitest.tooling-isolated.config.ts",
       "test/vitest/vitest.tooling.config.ts",
       "test/vitest/vitest.tui.config.ts",
       "test/vitest/vitest.ui.config.ts",
@@ -195,7 +365,10 @@ export const sharedVitestConfig = {
       "test/vitest/vitest.extension-zalo-paths.mjs",
       "test/vitest/vitest.extension-zalo.config.ts",
       "test/vitest/vitest.extension-provider-paths.mjs",
+      "test/vitest/vitest.extension-provider-openai.config.ts",
       "test/vitest/vitest.extension-providers.config.ts",
+      "test/vitest/vitest.extension-signal.config.ts",
+      "test/vitest/vitest.extension-slack.config.ts",
       "test/vitest/vitest.logging.config.ts",
       "test/vitest/vitest.process.config.ts",
       "test/vitest/vitest.tasks.config.ts",
@@ -213,7 +386,7 @@ export const sharedVitestConfig = {
       "ui/src/ui/views/chat.test.ts",
       "ui/src/ui/views/nodes.devices.test.ts",
       "ui/src/ui/views/skills.test.ts",
-      "ui/src/ui/views/dreams.test.ts",
+      "ui/src/ui/views/dreaming.test.ts",
       "ui/src/ui/views/usage-render-details.test.ts",
       "ui/src/ui/controllers/agents.test.ts",
       "ui/src/ui/controllers/chat.test.ts",
@@ -233,6 +406,7 @@ export const sharedVitestConfig = {
       "**/node_modules/**",
       "**/vendor/**",
       "dist/OpenClaw.app/**",
+      "**/._*",
       "**/*.live.test.ts",
       "**/*.e2e.test.ts",
     ],
@@ -246,7 +420,6 @@ export const sharedVitestConfig = {
         branches: 55,
         statements: 70,
       },
-      include: ["./src/**/*.ts"],
       exclude: [
         `${BUNDLED_PLUGIN_ROOT_DIR}/**`,
         "apps/**",
@@ -256,7 +429,6 @@ export const sharedVitestConfig = {
         "src/entry.ts",
         "src/index.ts",
         "src/runtime.ts",
-        "src/channel-web.ts",
         "src/logging.ts",
         "src/cli/**",
         "src/commands/**",
@@ -274,11 +446,11 @@ export const sharedVitestConfig = {
         "src/providers/**",
         "src/secrets/**",
         "src/agents/model-scan.ts",
-        "src/agents/pi-embedded-runner.ts",
+        "src/agents/embedded-agent-runner.ts",
         "src/agents/sandbox-paths.ts",
         "src/agents/sandbox.ts",
         "src/agents/skills-install.ts",
-        "src/agents/pi-tool-definition-adapter.ts",
+        "src/agents/agent-tool-definition-adapter.ts",
         "src/agents/tools/discord-actions*.ts",
         "src/agents/tools/slack-actions.ts",
         "src/infra/state-migrations.ts",
@@ -302,11 +474,10 @@ export const sharedVitestConfig = {
         "src/tui/**",
         "src/wizard/**",
         "src/browser/**",
-        "src/channels/web/**",
         "src/webchat/**",
         "src/gateway/server.ts",
         "src/gateway/client.ts",
-        "src/gateway/protocol/**",
+        "packages/gateway-protocol/src/**",
         "src/infra/tailscale.ts",
       ],
     },

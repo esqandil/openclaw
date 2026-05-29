@@ -1,11 +1,16 @@
+import type { UnifiedModelCatalogEntry } from "../model-catalog/types.js";
 import { createProviderApiKeyAuthMethod } from "../plugins/provider-api-key-auth.js";
+import { projectProviderCatalogResultToUnifiedTextRows } from "../plugins/provider-catalog-unified-text.js";
 import type {
   ProviderPlugin,
   ProviderCatalogContext,
   ProviderCatalogResult,
+  ProviderAuthMethod,
   ProviderPluginCatalog,
+  UnifiedModelCatalogProviderContext,
   ProviderPluginWizardSetup,
 } from "../plugins/types.js";
+import { normalizeStringEntries, uniqueStrings } from "../shared/string-normalization.js";
 import { definePluginEntry } from "./plugin-entry.js";
 import type {
   OpenClawPluginApi,
@@ -27,14 +32,18 @@ export type SingleProviderPluginApiKeyAuthOptions = Omit<
 export type SingleProviderPluginCatalogOptions =
   | {
       buildProvider: Parameters<typeof buildSingleProviderApiKeyCatalog>[0]["buildProvider"];
+      buildStaticProvider?: Parameters<typeof buildSingleProviderApiKeyCatalog>[0]["buildProvider"];
       allowExplicitBaseUrl?: boolean;
       run?: never;
       order?: never;
+      staticRun?: never;
     }
   | {
       run: ProviderPluginCatalog["run"];
+      staticRun?: ProviderPluginCatalog["run"];
       order?: ProviderPluginCatalog["order"];
       buildProvider?: never;
+      buildStaticProvider?: never;
       allowExplicitBaseUrl?: never;
     };
 
@@ -42,6 +51,11 @@ export type SingleProviderPluginOptions = {
   id: string;
   name: string;
   description: string;
+  /**
+   * @deprecated Declare exclusive plugin kind in `openclaw.plugin.json` via
+   * manifest `kind`. Runtime-entry `kind` remains only as a compatibility
+   * fallback for older plugins.
+   */
   kind?: OpenClawPluginDefinition["kind"];
   configSchema?: OpenClawPluginConfigSchema | (() => OpenClawPluginConfigSchema);
   provider?: {
@@ -51,10 +65,11 @@ export type SingleProviderPluginOptions = {
     aliases?: string[];
     envVars?: string[];
     auth?: SingleProviderPluginApiKeyAuthOptions[];
+    extraAuth?: ProviderAuthMethod[];
     catalog: SingleProviderPluginCatalogOptions;
   } & Omit<
     ProviderPlugin,
-    "id" | "label" | "docsPath" | "aliases" | "envVars" | "auth" | "catalog"
+    "id" | "label" | "docsPath" | "aliases" | "envVars" | "auth" | "catalog" | "staticCatalog"
   >;
   register?: (api: OpenClawPluginApi) => void;
 };
@@ -88,13 +103,25 @@ function resolveEnvVars(params: {
   envVars?: string[];
   auth?: SingleProviderPluginApiKeyAuthOptions[];
 }): string[] | undefined {
-  const combined = [
+  const combined = normalizeStringEntries([
     ...(params.envVars ?? []),
     ...(params.auth ?? []).map((entry) => entry.envVar).filter(Boolean),
-  ]
-    .map((value) => value.trim())
-    .filter(Boolean);
-  return combined.length > 0 ? [...new Set(combined)] : undefined;
+  ]);
+  return combined.length > 0 ? uniqueStrings(combined) : undefined;
+}
+
+async function runUnifiedTextCatalog(params: {
+  providerId: string;
+  catalog: ProviderPluginCatalog;
+  ctx: UnifiedModelCatalogProviderContext;
+  source: UnifiedModelCatalogEntry["source"];
+}): Promise<UnifiedModelCatalogEntry[]> {
+  const result = await params.catalog.run(params.ctx);
+  return projectProviderCatalogResultToUnifiedTextRows({
+    providerId: params.providerId,
+    result,
+    source: params.source,
+  });
 }
 
 export function defineSingleProviderPluginEntry(options: SingleProviderPluginOptions) {
@@ -126,6 +153,7 @@ export function defineSingleProviderPluginEntry(options: SingleProviderPluginOpt
             ...(wizard ? { wizard } : {}),
           });
         });
+        auth.push(...(provider.extraAuth ?? []));
         let catalog: ProviderPluginCatalog;
         if ("run" in provider.catalog) {
           const catalogRun = provider.catalog.run;
@@ -146,6 +174,22 @@ export function defineSingleProviderPluginEntry(options: SingleProviderPluginOpt
               }),
           };
         }
+        const staticCatalog: ProviderPluginCatalog | undefined =
+          "run" in provider.catalog
+            ? provider.catalog.staticRun
+              ? {
+                  order: provider.catalog.order ?? "simple",
+                  run: provider.catalog.staticRun,
+                }
+              : undefined
+            : provider.catalog.buildStaticProvider
+              ? {
+                  order: "simple",
+                  run: async () => ({
+                    provider: await provider.catalog.buildStaticProvider!(),
+                  }),
+                }
+              : undefined;
         api.registerProvider({
           id: providerId,
           label: provider.label,
@@ -154,12 +198,45 @@ export function defineSingleProviderPluginEntry(options: SingleProviderPluginOpt
           ...(envVars ? { envVars } : {}),
           auth,
           catalog,
+          ...(staticCatalog ? { staticCatalog } : {}),
           ...Object.fromEntries(
             Object.entries(provider).filter(
               ([key]) =>
-                !["id", "label", "docsPath", "aliases", "envVars", "auth", "catalog"].includes(key),
+                ![
+                  "id",
+                  "label",
+                  "docsPath",
+                  "aliases",
+                  "envVars",
+                  "auth",
+                  "extraAuth",
+                  "catalog",
+                  "staticCatalog",
+                ].includes(key),
             ),
           ),
+        });
+        api.registerModelCatalogProvider({
+          provider: providerId,
+          kinds: ["text"],
+          ...(staticCatalog
+            ? {
+                staticCatalog: (ctx: UnifiedModelCatalogProviderContext) =>
+                  runUnifiedTextCatalog({
+                    providerId,
+                    catalog: staticCatalog,
+                    ctx,
+                    source: "static",
+                  }),
+              }
+            : {}),
+          liveCatalog: (ctx: UnifiedModelCatalogProviderContext) =>
+            runUnifiedTextCatalog({
+              providerId,
+              catalog,
+              ctx,
+              source: "live",
+            }),
         });
       }
       options.register?.(api);

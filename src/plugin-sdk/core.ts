@@ -1,3 +1,4 @@
+import type { ResolvedConfiguredAcpBinding } from "../acp/persistent-bindings.types.js";
 import { buildChatChannelMetaById } from "../channels/chat-meta-shared.js";
 import type { ChatChannelId } from "../channels/ids.js";
 import { emptyChannelConfigSchema } from "../channels/plugins/config-schema.js";
@@ -11,7 +12,7 @@ import type {
   ChannelPairingAdapter,
   ChannelSecurityAdapter,
 } from "../channels/plugins/types.adapters.js";
-import type { ChannelConfigSchema, ChannelConfigUiHint } from "../channels/plugins/types.config.js";
+import type { ChannelConfigSchema } from "../channels/plugins/types.config.js";
 import type {
   ChannelMessagingAdapter,
   ChannelOutboundSessionRoute,
@@ -24,13 +25,21 @@ import type { ReplyToMode } from "../config/types.base.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { buildOutboundBaseSessionKey } from "../infra/outbound/base-session-key.js";
 import type { OutboundDeliveryResult } from "../infra/outbound/deliver.js";
+import { normalizeOutboundThreadId } from "../infra/outbound/thread-id.js";
 import { resolveBundledPluginsDir } from "../plugins/bundled-dir.js";
-import type { ProviderRuntimeModel } from "../plugins/provider-runtime-model.types.js";
 import type { PluginRuntime } from "../plugins/runtime/types.js";
 import type { OpenClawPluginApi } from "../plugins/types.js";
+import { resolveThreadSessionKeys } from "../routing/session-key.js";
+import {
+  normalizeSessionKeyPreservingOpaquePeerIds,
+  parseThreadSessionSuffix,
+} from "../sessions/session-key-utils.js";
 import { normalizeLowercaseStringOrEmpty } from "../shared/string-coerce.js";
 
 export type {
+  AgentPromptGuidance,
+  AgentPromptGuidanceEntry,
+  AgentPromptSurfaceKind,
   AgentHarness,
   AnyAgentTool,
   MediaUnderstandingProviderPlugin,
@@ -41,6 +50,36 @@ export type {
   OpenClawPluginService,
   OpenClawPluginServiceContext,
   PluginCommandContext,
+  PluginCommandResult,
+  PluginAgentEventEmitParams,
+  PluginAgentEventEmitResult,
+  PluginAgentEventSubscriptionRegistration,
+  PluginAgentTurnPrepareEvent,
+  PluginAgentTurnPrepareResult,
+  PluginControlUiDescriptor,
+  PluginHeartbeatPromptContributionEvent,
+  PluginHeartbeatPromptContributionResult,
+  PluginJsonValue,
+  PluginNextTurnInjection,
+  PluginNextTurnInjectionEnqueueResult,
+  PluginNextTurnInjectionRecord,
+  PluginRunContextGetParams,
+  PluginRunContextPatch,
+  PluginRuntimeLifecycleRegistration,
+  PluginSessionActionContext,
+  PluginSessionActionRegistration,
+  PluginSessionActionResult,
+  PluginSessionAttachmentParams,
+  PluginSessionAttachmentResult,
+  PluginSessionSchedulerJobHandle,
+  PluginSessionSchedulerJobRegistration,
+  PluginSessionTurnScheduleParams,
+  PluginSessionTurnUnscheduleByTagParams,
+  PluginSessionTurnUnscheduleByTagResult,
+  PluginSessionExtensionRegistration,
+  PluginSessionExtensionProjection,
+  PluginToolMetadataRegistration,
+  PluginTrustedToolPolicyRegistration,
   PluginLogger,
   ProviderAuthContext,
   ProviderAuthDoctorHintContext,
@@ -80,28 +119,44 @@ export type {
   ProviderTransportTurnState,
   ProviderToolSchemaDiagnostic,
   ProviderResolveUsageAuthContext,
+  ProviderThinkingProfile,
   ProviderThinkingPolicyContext,
   ProviderValidateReplayTurnsContext,
   ProviderWebSocketSessionPolicy,
   ProviderWrapStreamFnContext,
+  UnifiedModelCatalogProviderContext,
+  UnifiedModelCatalogProviderPlugin,
   SpeechProviderPlugin,
 } from "./plugin-entry.js";
+export type {
+  UnifiedModelCatalogEntry,
+  UnifiedModelCatalogKind,
+  UnifiedModelCatalogSource,
+} from "../model-catalog/types.js";
 export type { ProviderRuntimeModel } from "../plugins/provider-runtime-model.types.js";
-export type { OpenClawPluginToolContext, OpenClawPluginToolFactory } from "../plugins/types.js";
+export type {
+  OpenClawPluginActiveModelContext,
+  OpenClawPluginToolContext,
+  OpenClawPluginToolFactory,
+} from "../plugins/types.js";
 export type {
   MemoryPluginCapability,
   MemoryPluginPublicArtifact,
   MemoryPluginPublicArtifactsProvider,
 } from "../plugins/memory-state.js";
 export type {
+  PluginHookReplyPayloadSendingContext,
+  PluginHookReplyPayloadSendingEvent,
+  PluginHookReplyPayloadSendingResult,
+  PluginHookReplyPayload,
   PluginHookReplyDispatchContext,
   PluginHookReplyDispatchEvent,
   PluginHookReplyDispatchResult,
 } from "../plugins/types.js";
 export type { OpenClawConfig } from "../config/config.js";
 export type { OutboundIdentity } from "../infra/outbound/identity.js";
-export type { HistoryEntry } from "../auto-reply/reply/history.js";
-export type { ReplyPayload } from "../auto-reply/reply-payload.js";
+export type { HistoryEntry } from "../auto-reply/reply/history.types.js";
+export type { ReplyPayload } from "./reply-payload.js";
 export type { AllowlistMatch } from "../channels/allowlist-match.js";
 export type {
   BaseProbeResult,
@@ -153,7 +208,11 @@ export type { PluginRuntime, RuntimeLogger } from "../plugins/runtime/types.js";
 export type { WizardPrompter } from "../wizard/prompts.js";
 
 export { definePluginEntry } from "./plugin-entry.js";
-export { buildPluginConfigSchema, emptyPluginConfigSchema } from "../plugins/config-schema.js";
+export {
+  buildJsonPluginConfigSchema,
+  buildPluginConfigSchema,
+  emptyPluginConfigSchema,
+} from "../plugins/config-schema.js";
 export { KeyedAsyncQueue, enqueueKeyedTask } from "./keyed-async-queue.js";
 export { createDedupeCache, resolveGlobalDedupeCache } from "../infra/dedupe.js";
 export { generateSecureToken, generateSecureUuid } from "../infra/secure-random.js";
@@ -164,6 +223,7 @@ export {
 export { DEFAULT_ACCOUNT_ID, normalizeAccountId } from "../routing/session-key.js";
 export {
   buildChannelConfigSchema,
+  buildJsonChannelConfigSchema,
   emptyChannelConfigSchema,
 } from "../channels/plugins/config-schema.js";
 export {
@@ -209,8 +269,15 @@ export {
 export { parseStrictPositiveInteger } from "../infra/parse-finite-number.js";
 export { isTrustedProxyAddress, resolveClientIp } from "../gateway/net.js";
 export { formatZonedTimestamp } from "../infra/format-time/format-datetime.js";
-export { ensureConfiguredAcpBindingReady } from "../acp/persistent-bindings.lifecycle.js";
 export { resolveConfiguredAcpBindingRecord } from "../acp/persistent-bindings.resolve.js";
+
+export async function ensureConfiguredAcpBindingReady(params: {
+  cfg: OpenClawConfig;
+  configuredBinding: ResolvedConfiguredAcpBinding | null;
+}): Promise<{ ok: true } | { ok: false; error: string }> {
+  const runtime = await import("../acp/persistent-bindings.lifecycle.js");
+  return runtime.ensureConfiguredAcpBindingReady(params);
+}
 
 export { resolveTailnetHostWithRunner } from "../shared/tailscale-status.js";
 export type {
@@ -228,7 +295,7 @@ export type ChannelOutboundSessionRouteParams = Parameters<
   NonNullable<ChannelMessagingAdapter["resolveOutboundSessionRoute"]>
 >[0];
 
-var cachedSdkChatChannelMeta:
+let cachedSdkChatChannelMeta:
   | {
       cacheKey: string;
       metaById: ReturnType<typeof buildChatChannelMetaById>;
@@ -300,6 +367,96 @@ export function buildChannelOutboundSessionRoute(params: {
   };
 }
 
+export type ThreadAwareOutboundSessionRouteThreadSource =
+  | "replyToId"
+  | "threadId"
+  | "currentSession";
+
+export type ThreadAwareOutboundSessionRouteRecoveryContext = {
+  route: ChannelOutboundSessionRoute;
+  currentBaseSessionKey: string;
+  currentThreadId: string;
+};
+
+export function recoverCurrentThreadSessionId(params: {
+  route: ChannelOutboundSessionRoute;
+  currentSessionKey?: string | null;
+  canRecover?: (context: ThreadAwareOutboundSessionRouteRecoveryContext) => boolean;
+}): string | undefined {
+  const current = parseThreadSessionSuffix(params.currentSessionKey);
+  if (!current.baseSessionKey || !current.threadId) {
+    return undefined;
+  }
+  if (
+    normalizeSessionKeyPreservingOpaquePeerIds(current.baseSessionKey) !==
+    normalizeSessionKeyPreservingOpaquePeerIds(params.route.baseSessionKey)
+  ) {
+    return undefined;
+  }
+  const context = {
+    route: params.route,
+    currentBaseSessionKey: current.baseSessionKey,
+    currentThreadId: current.threadId,
+  };
+  if (params.canRecover && !params.canRecover(context)) {
+    return undefined;
+  }
+  return current.threadId;
+}
+
+export function buildThreadAwareOutboundSessionRoute(params: {
+  route: ChannelOutboundSessionRoute;
+  replyToId?: string | number | null;
+  threadId?: string | number | null;
+  currentSessionKey?: string | null;
+  precedence?: readonly ThreadAwareOutboundSessionRouteThreadSource[];
+  useSuffix?: boolean;
+  parentSessionKey?: string;
+  normalizeThreadId?: (threadId: string) => string;
+  canRecoverCurrentThread?: (context: ThreadAwareOutboundSessionRouteRecoveryContext) => boolean;
+}): ChannelOutboundSessionRoute {
+  const recoveredThreadId = recoverCurrentThreadSessionId({
+    route: params.route,
+    currentSessionKey: params.currentSessionKey,
+    canRecover: params.canRecoverCurrentThread,
+  });
+  const candidates: Record<
+    ThreadAwareOutboundSessionRouteThreadSource,
+    { routeThreadId: string | number; sessionThreadId: string } | undefined
+  > = {
+    replyToId: resolveThreadAwareOutboundCandidate(params.replyToId),
+    threadId: resolveThreadAwareOutboundCandidate(params.threadId),
+    currentSession: resolveThreadAwareOutboundCandidate(recoveredThreadId),
+  };
+  const precedence = params.precedence ?? ["replyToId", "threadId", "currentSession"];
+  const candidate = precedence.map((source) => candidates[source]).find(Boolean);
+  const threadKeys = resolveThreadSessionKeys({
+    baseSessionKey: params.route.baseSessionKey,
+    threadId: candidate?.sessionThreadId,
+    parentSessionKey: candidate ? params.parentSessionKey : undefined,
+    useSuffix: params.useSuffix,
+    normalizeThreadId: params.normalizeThreadId,
+  });
+  return {
+    ...params.route,
+    sessionKey: threadKeys.sessionKey,
+    ...(candidate !== undefined ? { threadId: candidate.routeThreadId } : {}),
+  };
+}
+
+function resolveThreadAwareOutboundCandidate(
+  threadId?: string | number | null,
+): { routeThreadId: string | number; sessionThreadId: string } | undefined {
+  const sessionThreadId = normalizeOutboundThreadId(threadId);
+  if (sessionThreadId === undefined) {
+    return undefined;
+  }
+  return {
+    routeThreadId: typeof threadId === "number" ? threadId : sessionThreadId,
+    sessionThreadId,
+  };
+}
+
 /** Options for a channel plugin entry that should register a channel capability. */
 type ChannelEntryConfigSchema<TPlugin> =
   TPlugin extends ChannelPlugin<unknown>
@@ -338,6 +495,7 @@ type CreateChannelPluginBaseOptions<TResolvedAccount> = {
   streaming?: ChannelPlugin<TResolvedAccount>["streaming"];
   reload?: ChannelPlugin<TResolvedAccount>["reload"];
   gatewayMethods?: ChannelPlugin<TResolvedAccount>["gatewayMethods"];
+  gatewayMethodDescriptors?: ChannelPlugin<TResolvedAccount>["gatewayMethodDescriptors"];
   configSchema?: ChannelPlugin<TResolvedAccount>["configSchema"];
   config?: ChannelPlugin<TResolvedAccount>["config"];
   security?: ChannelPlugin<TResolvedAccount>["security"];
@@ -360,6 +518,7 @@ type CreatedChannelPluginBase<TResolvedAccount> = Pick<
       | "streaming"
       | "reload"
       | "gatewayMethods"
+      | "gatewayMethodDescriptors"
       | "configSchema"
       | "config"
       | "security"
@@ -398,8 +557,16 @@ export function defineChannelPluginEntry<TPlugin>({
         registerCliMetadata?.(api);
         return;
       }
-      setRuntime?.(api.runtime);
+      if (api.registrationMode === "tool-discovery") {
+        registerFull?.(api);
+        return;
+      }
       api.registerChannel({ plugin: plugin as ChannelPlugin });
+      setRuntime?.(api.runtime);
+      if (api.registrationMode === "discovery") {
+        registerCliMetadata?.(api);
+        return;
+      }
       if (api.registrationMode !== "full") {
         return;
       }
@@ -664,6 +831,9 @@ export function createChannelPluginBase<TResolvedAccount>(
     ...(params.streaming ? { streaming: params.streaming } : {}),
     ...(params.reload ? { reload: params.reload } : {}),
     ...(params.gatewayMethods ? { gatewayMethods: params.gatewayMethods } : {}),
+    ...(params.gatewayMethodDescriptors
+      ? { gatewayMethodDescriptors: params.gatewayMethodDescriptors }
+      : {}),
     ...(params.configSchema ? { configSchema: params.configSchema } : {}),
     ...(params.config ? { config: params.config } : {}),
     ...(params.security ? { security: params.security } : {}),

@@ -8,6 +8,7 @@ import type { AuthProfileStore } from "../agents/auth-profiles/types.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import type { SecretProviderConfig, SecretRef, SecretRefSource } from "../config/types.secrets.js";
 import { isSafeExecutableValue } from "../infra/exec-safety.js";
+import { parseStrictPositiveInteger } from "../infra/parse-finite-number.js";
 import { normalizeAgentId } from "../routing/session-key.js";
 import {
   normalizeOptionalLowercaseString,
@@ -68,8 +69,8 @@ function parseOptionalPositiveInt(value: string, max: number): number | undefine
   if (!/^\d+$/.test(trimmed)) {
     return undefined;
   }
-  const parsed = Number.parseInt(trimmed, 10);
-  if (!Number.isFinite(parsed) || parsed <= 0 || parsed > max) {
+  const parsed = parseStrictPositiveInteger(trimmed);
+  if (parsed === undefined || parsed > max) {
     return undefined;
   }
   return parsed;
@@ -446,6 +447,13 @@ async function promptFileProvider(
     initialValue: base?.maxBytes,
     max: 20 * 1024 * 1024,
   });
+  const allowInsecurePath = assertNoCancel(
+    await confirm({
+      message: "Allow insecure file path checks?",
+      initialValue: base?.allowInsecurePath ?? false,
+    }),
+    "Secrets configure cancelled.",
+  );
 
   return {
     source: "file",
@@ -453,6 +461,7 @@ async function promptFileProvider(
     mode,
     ...(timeoutMs ? { timeoutMs } : {}),
     ...(maxBytes ? { maxBytes } : {}),
+    ...(allowInsecurePath ? { allowInsecurePath: true } : {}),
   };
 }
 

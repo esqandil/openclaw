@@ -1,6 +1,7 @@
 import { mapAllowFromEntries } from "openclaw/plugin-sdk/channel-config-helpers";
 import { normalizeChatType, type ChatType } from "../../channels/chat-type.js";
 import type { ChannelOutboundTargetMode } from "../../channels/plugins/types.core.js";
+import type { ChannelId } from "../../channels/plugins/types.public.js";
 import type { SessionEntry } from "../../config/sessions.js";
 import type { AgentDefaultsConfig } from "../../config/types.agent-defaults.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
@@ -22,6 +23,8 @@ import {
   normalizeDeliverableOutboundChannel,
   resolveOutboundChannelPlugin,
 } from "./channel-resolution.js";
+import { resolveOutboundSessionRoute } from "./outbound-session.js";
+import { resolveChannelTarget, type ResolvedMessagingTarget } from "./target-resolver.js";
 import {
   resolveOutboundTargetWithPlugin,
   type OutboundTargetResolution,
@@ -34,6 +37,7 @@ export type HeartbeatTarget = OutboundChannel;
 export type OutboundTarget = {
   channel: OutboundChannel;
   to?: string;
+  chatType?: ChatType;
   reason?: string;
   accountId?: string;
   threadId?: string | number;
@@ -56,6 +60,7 @@ export function resolveOutboundTarget(params: {
   channel: GatewayMessageChannel;
   to?: string;
   allowFrom?: string[];
+  allowBootstrap?: boolean;
   cfg?: OpenClawConfig;
   accountId?: string | null;
   mode?: ChannelOutboundTargetMode;
@@ -65,6 +70,7 @@ export function resolveOutboundTarget(params: {
       plugin: resolveOutboundChannelPlugin({
         channel: params.channel,
         cfg: params.cfg,
+        allowBootstrap: params.allowBootstrap,
       }),
       target: params,
       onMissingPlugin: () =>
@@ -220,7 +226,8 @@ export function resolveHeartbeatDeliveryTarget(params: {
     }
   }
 
-  const inheritedHeartbeatThreadId = shouldReuseHeartbeatTelegramTopicThread({
+  const inheritedHeartbeatThreadId = shouldReuseHeartbeatRouteThreadId({
+    cfg,
     target,
     heartbeat,
     turnSource: params.turnSource,
@@ -233,12 +240,11 @@ export function resolveHeartbeatDeliveryTarget(params: {
   return {
     channel: resolvedTarget.channel,
     to: resolved.to,
+    chatType: deliveryChatType,
     reason,
     accountId: effectiveAccountId,
-    // Heartbeats normally avoid inheriting session reply-thread IDs, but
-    // Telegram forum-topic sessions encode the topic as part of the
-    // destination identity. Preserve that topic routing when the heartbeat is
-    // still targeting the same group session.
+    // Heartbeats normally avoid inheriting session reply-thread IDs, but some
+    // plugins encode thread/topic ids as part of the destination identity.
     threadId: resolvedTarget.threadId ?? inheritedHeartbeatThreadId,
     lastChannel: resolvedTarget.lastChannel,
     lastAccountId: resolvedTarget.lastAccountId,
@@ -257,6 +263,79 @@ function buildNoHeartbeatDeliveryTarget(params: {
     accountId: params.accountId,
     lastChannel: params.lastChannel,
     lastAccountId: params.lastAccountId,
+  };
+}
+
+export async function resolveHeartbeatDeliveryTargetWithSessionRoute(params: {
+  cfg: OpenClawConfig;
+  agentId: string;
+  entry?: SessionEntry;
+  heartbeat?: AgentDefaultsConfig["heartbeat"];
+  turnSource?: DeliveryContext;
+  currentSessionKey?: string;
+}): Promise<OutboundTarget> {
+  const delivery = resolveHeartbeatDeliveryTarget(params);
+  const heartbeat = params.heartbeat ?? params.cfg.agents?.defaults?.heartbeat;
+  if (delivery.channel === "none" || !delivery.to) {
+    return delivery;
+  }
+  const deliveryTo = delivery.to;
+  const plugin = resolveOutboundChannelPlugin({
+    channel: delivery.channel,
+    cfg: params.cfg,
+  });
+  if (!plugin?.messaging?.resolveOutboundSessionRoute) {
+    return delivery;
+  }
+  let routeResolvedTarget: ResolvedMessagingTarget | undefined;
+  const targetResolution = await (async () => {
+    try {
+      return await resolveChannelTarget({
+        cfg: params.cfg,
+        channel: delivery.channel as ChannelId,
+        input: deliveryTo,
+        accountId: delivery.accountId,
+        unknownTargetMode: "normalized",
+      });
+    } catch {
+      return null;
+    }
+  })();
+  if (targetResolution?.ok) {
+    routeResolvedTarget = targetResolution.target;
+  }
+  const route = await (async () => {
+    try {
+      return await resolveOutboundSessionRoute({
+        cfg: params.cfg,
+        channel: delivery.channel as ChannelId,
+        agentId: params.agentId,
+        accountId: delivery.accountId,
+        target: routeResolvedTarget?.to ?? deliveryTo,
+        resolvedTarget: routeResolvedTarget,
+        currentSessionKey: params.currentSessionKey,
+        threadId: delivery.threadId,
+      });
+    } catch {
+      return null;
+    }
+  })();
+  if (!route) {
+    return delivery;
+  }
+  if (route.chatType === "direct" && heartbeat?.directPolicy === "block") {
+    return buildNoHeartbeatDeliveryTarget({
+      reason: "dm-blocked",
+      accountId: delivery.accountId,
+      lastChannel: delivery.lastChannel,
+      lastAccountId: delivery.lastAccountId,
+    });
+  }
+  return {
+    ...delivery,
+    to: route.to,
+    chatType: route.chatType,
+    threadId: route.threadId ?? delivery.threadId,
   };
 }
 
@@ -299,20 +378,24 @@ function resolveHeartbeatDeliveryChatType(params: {
   });
 }
 
-function shouldReuseHeartbeatTelegramTopicThread(params: {
+function shouldReuseHeartbeatRouteThreadId(params: {
+  cfg: OpenClawConfig;
   target: HeartbeatTarget;
   heartbeat?: AgentDefaultsConfig["heartbeat"];
   turnSource?: DeliveryContext;
   entry?: SessionEntry;
   resolvedTarget: SessionDeliveryTarget;
 }): boolean {
+  const channel = params.resolvedTarget.channel;
+  const messaging =
+    channel && resolveOutboundChannelPlugin({ channel, cfg: params.cfg })?.messaging;
   return (
+    messaging?.preserveHeartbeatThreadIdForGroupRoute === true &&
     params.resolvedTarget.threadId == null &&
     params.target === "last" &&
     !params.heartbeat?.to &&
     params.turnSource?.threadId == null &&
-    params.resolvedTarget.channel === "telegram" &&
-    params.resolvedTarget.lastChannel === "telegram" &&
+    params.resolvedTarget.channel === params.resolvedTarget.lastChannel &&
     Boolean(params.resolvedTarget.to) &&
     Boolean(params.resolvedTarget.lastTo) &&
     params.resolvedTarget.to === params.resolvedTarget.lastTo &&

@@ -10,27 +10,10 @@ import {
 } from "../navigation-guard.js";
 import type { BrowserRouteContext, ProfileContext } from "../server-context.js";
 import { resolveTargetIdFromTabs } from "../target-id.js";
+import { browserNavigationPolicyForProfile, resolveProfileContext } from "./agent.shared.js";
+import { readRouteNonNegativeInteger } from "./route-numeric.js";
 import type { BrowserRequest, BrowserResponse, BrowserRouteRegistrar } from "./types.js";
-import {
-  asyncBrowserRoute,
-  getProfileContext,
-  jsonError,
-  toNumber,
-  toStringOrEmpty,
-} from "./utils.js";
-
-function resolveTabsProfileContext(
-  req: BrowserRequest,
-  res: BrowserResponse,
-  ctx: BrowserRouteContext,
-) {
-  const profileCtx = getProfileContext(req, ctx);
-  if ("error" in profileCtx) {
-    jsonError(res, profileCtx.status, profileCtx.error);
-    return null;
-  }
-  return profileCtx;
-}
+import { asyncBrowserRoute, jsonError, toStringOrEmpty } from "./utils.js";
 
 function handleTabsRouteError(
   ctx: BrowserRouteContext,
@@ -54,7 +37,7 @@ async function withTabsProfileRoute(params: {
   mapTabError?: boolean;
   run: (profileCtx: ProfileContext) => Promise<void>;
 }) {
-  const profileCtx = resolveTabsProfileContext(params.req, params.res, params.ctx);
+  const profileCtx = resolveProfileContext(params.req, params.res, params.ctx);
   if (!profileCtx) {
     return;
   }
@@ -121,6 +104,38 @@ function parseRequiredTargetId(res: BrowserResponse, rawTargetId: unknown): stri
   return targetId;
 }
 
+function readOptionalTabLabel(body: unknown): string | undefined {
+  const label = toStringOrEmpty((body as { label?: unknown })?.label);
+  return label || undefined;
+}
+
+function readTabIndex(
+  res: BrowserResponse,
+  body: unknown,
+  opts?: { required?: boolean },
+): number | null | undefined {
+  const record = body && typeof body === "object" ? (body as Record<string, unknown>) : {};
+  if (!Object.hasOwn(record, "index")) {
+    if (opts?.required) {
+      jsonError(res, 400, "index is required");
+      return null;
+    }
+    return undefined;
+  }
+  if (record.index == null) {
+    jsonError(res, 400, "index must be a non-negative integer");
+    return null;
+  }
+  try {
+    return readRouteNonNegativeInteger(record.index, "index", {
+      invalidMessage: "index must be a non-negative integer",
+    });
+  } catch (error) {
+    jsonError(res, 400, error instanceof Error ? error.message : String(error));
+    return null;
+  }
+}
+
 async function runTabTargetMutation(params: {
   req: BrowserRequest;
   res: BrowserResponse;
@@ -170,6 +185,7 @@ export function registerBrowserTabRoutes(app: BrowserRouteRegistrar, ctx: Browse
     "/tabs/open",
     asyncBrowserRoute(async (req, res) => {
       const url = toStringOrEmpty((req.body as { url?: unknown })?.url);
+      const label = readOptionalTabLabel(req.body);
       if (!url) {
         return jsonError(res, 400, "url is required");
       }
@@ -182,10 +198,10 @@ export function registerBrowserTabRoutes(app: BrowserRouteRegistrar, ctx: Browse
         run: async (profileCtx) => {
           await assertBrowserNavigationAllowed({
             url,
-            ...withBrowserNavigationPolicy(ctx.state().resolved.ssrfPolicy),
+            ...browserNavigationPolicyForProfile(ctx, profileCtx),
           });
           await profileCtx.ensureBrowserAvailable();
-          const tab = await profileCtx.openTab(url);
+          const tab = await profileCtx.openTab(url, { label });
           res.json(tab);
         },
       });
@@ -211,13 +227,13 @@ export function registerBrowserTabRoutes(app: BrowserRouteRegistrar, ctx: Browse
             if (resolved.reason === "ambiguous") {
               throw new BrowserTargetAmbiguousError();
             }
-            throw new BrowserTabNotFoundError();
+            throw new BrowserTabNotFoundError({ input: id });
           }
           const tab = tabs.find((currentTab) => currentTab.targetId === resolved.targetId);
           if (!tab) {
-            throw new BrowserTabNotFoundError();
+            throw new BrowserTabNotFoundError({ input: id });
           }
-          const ssrfPolicyOpts = withBrowserNavigationPolicy(ctx.state().resolved.ssrfPolicy);
+          const ssrfPolicyOpts = browserNavigationPolicyForProfile(ctx, profileCtx);
           if (ssrfPolicyOpts.ssrfPolicy) {
             await assertBrowserNavigationResultAllowed({
               url: tab.url,
@@ -253,7 +269,6 @@ export function registerBrowserTabRoutes(app: BrowserRouteRegistrar, ctx: Browse
     "/tabs/action",
     asyncBrowserRoute(async (req, res) => {
       const action = toStringOrEmpty((req.body as { action?: unknown })?.action);
-      const index = toNumber((req.body as { index?: unknown })?.index);
 
       await withTabsProfileRoute({
         req,
@@ -275,12 +290,37 @@ export function registerBrowserTabRoutes(app: BrowserRouteRegistrar, ctx: Browse
 
           if (action === "new") {
             await profileCtx.ensureBrowserAvailable();
-            const tab = await profileCtx.openTab("about:blank");
+            const tab = await profileCtx.openTab("about:blank", {
+              label: readOptionalTabLabel(req.body),
+            });
+            return res.json({ ok: true, tab });
+          }
+
+          if (action === "label") {
+            if (!(await ensureBrowserRunning(profileCtx, res))) {
+              return;
+            }
+            const targetId = parseRequiredTargetId(
+              res,
+              (req.body as { targetId?: unknown })?.targetId,
+            );
+            if (!targetId) {
+              return;
+            }
+            const label = readOptionalTabLabel(req.body);
+            if (!label) {
+              return jsonError(res, 400, "label is required");
+            }
+            const tab = await profileCtx.labelTab(targetId, label);
             return res.json({ ok: true, tab });
           }
 
           if (action === "close") {
             if (!(await ensureBrowserRunning(profileCtx, res))) {
+              return;
+            }
+            const index = readTabIndex(res, req.body);
+            if (index === null) {
               return;
             }
             const tabs = await profileCtx.listTabs();
@@ -293,8 +333,9 @@ export function registerBrowserTabRoutes(app: BrowserRouteRegistrar, ctx: Browse
           }
 
           if (action === "select") {
-            if (typeof index !== "number") {
-              return jsonError(res, 400, "index is required");
+            const index = readTabIndex(res, req.body, { required: true });
+            if (index === null || index === undefined) {
+              return;
             }
             if (!(await ensureBrowserRunning(profileCtx, res))) {
               return;
@@ -304,7 +345,7 @@ export function registerBrowserTabRoutes(app: BrowserRouteRegistrar, ctx: Browse
             if (!target) {
               throw new BrowserTabNotFoundError();
             }
-            const ssrfPolicyOpts = withBrowserNavigationPolicy(ctx.state().resolved.ssrfPolicy);
+            const ssrfPolicyOpts = browserNavigationPolicyForProfile(ctx, profileCtx);
             if (ssrfPolicyOpts.ssrfPolicy) {
               await assertBrowserNavigationResultAllowed({
                 url: target.url,

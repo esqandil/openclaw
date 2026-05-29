@@ -10,6 +10,7 @@ import {
   buildPlatformRuntimeLogHints,
   buildPlatformServiceStartHints,
 } from "../../daemon/runtime-hints.js";
+import { parseInlineOptionToken } from "../../infra/inline-option-token.js";
 import { colorize, isRich, theme } from "../../terminal/theme.js";
 import { formatCliCommand } from "../command-format.js";
 import { parsePort } from "../shared/parse-port.js";
@@ -76,7 +77,8 @@ export function parsePortFromArgs(programArguments: string[] | undefined): numbe
       }
     }
     if (arg?.startsWith("--port=")) {
-      const parsed = parsePort(arg.split("=", 2)[1]);
+      const option = parseInlineOptionToken(arg);
+      const parsed = parsePort(option.hasInlineValue ? option.inlineValue : undefined);
       if (parsed) {
         return parsed;
       }
@@ -144,7 +146,7 @@ export function normalizeListenerAddress(raw: string): string {
 }
 
 export function renderRuntimeHints(
-  runtime: { missingUnit?: boolean; status?: string } | undefined,
+  runtime: { missingUnit?: boolean; missingSupervision?: boolean; status?: string } | undefined,
   env: NodeJS.ProcessEnv = process.env,
   logFile?: string | null,
 ): string[] {
@@ -155,6 +157,15 @@ export function renderRuntimeHints(
   const fileLog = logFile ?? null;
   if (runtime.missingUnit) {
     hints.push(`Service not installed. Run: ${formatCliCommand("openclaw gateway install", env)}`);
+    if (fileLog) {
+      hints.push(`File logs: ${fileLog}`);
+    }
+    return hints;
+  }
+  if (runtime.missingSupervision) {
+    hints.push(
+      `LaunchAgent installed but not loaded. Run: ${formatCliCommand("openclaw gateway restart", env)}`,
+    );
     if (fileLog) {
       hints.push(`File logs: ${fileLog}`);
     }

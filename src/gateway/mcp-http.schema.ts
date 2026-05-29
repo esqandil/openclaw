@@ -1,4 +1,5 @@
 import { logWarn } from "../logger.js";
+import { uniqueValues } from "../shared/string-normalization.js";
 import { resolveGatewayScopedTools } from "./tool-resolution.js";
 
 export type McpLoopbackTool = ReturnType<typeof resolveGatewayScopedTools>["tools"][number];
@@ -29,7 +30,7 @@ function flattenUnionSchema(raw: Record<string, unknown>): Record<string, unknow
         if (Array.isArray(existing.enum) && Array.isArray(incoming.enum)) {
           mergedProps[key] = {
             ...existing,
-            enum: [...new Set([...(existing.enum as unknown[]), ...(incoming.enum as unknown[])])],
+            enum: uniqueValues([...(existing.enum as unknown[]), ...(incoming.enum as unknown[])]),
           };
           continue;
         }
@@ -70,9 +71,9 @@ export function buildMcpToolSchema(tools: McpLoopbackTool[]): McpToolSchemaEntry
     }
     if (raw.type !== "object") {
       raw.type = "object";
-      if (!raw.properties) {
-        raw.properties = {};
-      }
+    }
+    if (!raw.properties) {
+      raw.properties = {};
     }
     return {
       name: tool.name,

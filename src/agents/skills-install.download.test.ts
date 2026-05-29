@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { Readable } from "node:stream";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { installDownloadSpec } from "./skills-install-download.js";
 import { setTempStateDir } from "./skills-install.download-test-utils.js";
@@ -93,11 +94,28 @@ async function installDownloadSkill(params: {
 }
 
 function mockArchiveResponse(buffer: Uint8Array): void {
-  const blobPart = Uint8Array.from(buffer);
   fetchWithSsrFGuardMock.mockResolvedValue({
-    response: new Response(new Blob([blobPart]), { status: 200 }),
+    response: {
+      ok: true,
+      status: 200,
+      statusText: "OK",
+      body: Readable.from([Buffer.from(buffer)]),
+    },
     release: async () => undefined,
   });
+}
+
+function createCancelableBody() {
+  let canceled = false;
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(new Uint8Array([1, 2, 3]));
+    },
+    cancel() {
+      canceled = true;
+    },
+  });
+  return { stream, wasCanceled: () => canceled };
 }
 
 function runCommandResult(params?: Partial<Record<"code" | "stdout" | "stderr", string | number>>) {
@@ -161,18 +179,25 @@ beforeEach(() => {
 describe("installDownloadSpec extraction safety", () => {
   it("rejects targetDir escapes outside the per-skill tools root", async () => {
     const beforeFetchCalls = fetchWithSsrFGuardMock.mock.calls.length;
+    const entry = buildEntry("relative-traversal");
+    const toolsRoot = resolveSkillToolsRootDir(entry);
+    const escapedTargetDir = path.resolve(toolsRoot, "../outside");
 
-    const result = await installDownloadSkill({
-      name: "relative-traversal",
-      url: "https://example.invalid/good.zip",
-      archive: "zip",
-      targetDir: "../outside",
+    const result = await installDownloadSpec({
+      entry,
+      spec: buildDownloadSpec({
+        url: "https://example.invalid/good.zip",
+        archive: "zip",
+        targetDir: "../outside",
+      }),
+      timeoutMs: 30_000,
     });
 
     expect(result.ok).toBe(false);
     expect(result.stderr).toContain("Refusing to install outside the skill tools directory");
     expect(fetchWithSsrFGuardMock.mock.calls.length).toBe(beforeFetchCalls);
-    expect(stateDir.length).toBeGreaterThan(0);
+    await expect(fileExists(toolsRoot)).resolves.toBe(true);
+    await expect(fileExists(escapedTargetDir)).resolves.toBe(false);
   });
 
   it("allows relative targetDir inside the per-skill tools root", async () => {
@@ -199,27 +224,59 @@ describe("installDownloadSpec extraction safety", () => {
     ).toBe("payload");
   });
 
+  it("cancels failed download response bodies before returning the error", async () => {
+    const { stream, wasCanceled } = createCancelableBody();
+    const release = vi.fn(async () => undefined);
+    fetchWithSsrFGuardMock.mockResolvedValue({
+      response: {
+        ok: false,
+        status: 500,
+        statusText: "Server Error",
+        body: stream,
+      },
+      release,
+    });
+
+    const result = await installDownloadSpec({
+      entry: buildEntry("failed-download-body"),
+      spec: {
+        kind: "download",
+        id: "dl",
+        url: "https://example.invalid/broken.bin",
+        extract: false,
+        targetDir: "runtime",
+      },
+      timeoutMs: 30_000,
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.stderr).toContain("Download failed (500 Server Error)");
+    expect(wasCanceled()).toBe(true);
+    expect(release).toHaveBeenCalledOnce();
+  });
+
   it.runIf(process.platform !== "win32")(
     "fails closed when the lexical tools root is rebound before the final copy",
     async () => {
       const entry = buildEntry("base-rebind");
-      const safeRoot = resolveSkillToolsRootDir(entry);
+      const safeToolsRoot = resolveSkillToolsRootDir(entry);
       const outsideRoot = path.join(workspaceDir, "outside-root");
       await fs.mkdir(outsideRoot, { recursive: true });
 
       fetchWithSsrFGuardMock.mockResolvedValue({
-        response: new Response(
-          new ReadableStream({
-            async start(controller) {
-              controller.enqueue(new Uint8Array(Buffer.from("payload")));
-              const reboundRoot = `${safeRoot}-rebound`;
-              await fs.rename(safeRoot, reboundRoot);
-              await fs.symlink(outsideRoot, safeRoot);
-              controller.close();
-            },
-          }),
-          { status: 200 },
-        ),
+        response: {
+          ok: true,
+          status: 200,
+          statusText: "OK",
+          body: Readable.from(
+            (async function* () {
+              yield Buffer.from("payload");
+              const reboundRoot = `${safeToolsRoot}-rebound`;
+              await fs.rename(safeToolsRoot, reboundRoot);
+              await fs.symlink(outsideRoot, safeToolsRoot);
+            })(),
+          ),
+        },
         release: async () => undefined,
       });
 

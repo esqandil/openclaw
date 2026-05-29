@@ -1,3 +1,4 @@
+import { cloneAuthProfileStore } from "./clone.js";
 import { hasUsableOAuthCredential as hasUsableStoredOAuthCredential } from "./credential-state.js";
 import type { AuthProfileStore, OAuthCredential } from "./types.js";
 
@@ -59,23 +60,25 @@ export function hasUsableOAuthCredential(
   return hasUsableStoredOAuthCredential(credential, { now });
 }
 
-function normalizeAuthIdentityToken(value: string | undefined): string | undefined {
+export function normalizeAuthIdentityToken(value: string | undefined): string | undefined {
   const trimmed = value?.trim();
   return trimmed ? trimmed : undefined;
 }
 
-function normalizeAuthEmailToken(value: string | undefined): string | undefined {
+export function normalizeAuthEmailToken(value: string | undefined): string | undefined {
   return normalizeAuthIdentityToken(value)?.toLowerCase();
 }
 
-function hasOAuthIdentity(credential: Pick<OAuthCredential, "accountId" | "email">): boolean {
+export function hasOAuthIdentity(
+  credential: Pick<OAuthCredential, "accountId" | "email">,
+): boolean {
   return (
     normalizeAuthIdentityToken(credential.accountId) !== undefined ||
     normalizeAuthEmailToken(credential.email) !== undefined
   );
 }
 
-function hasMatchingOAuthIdentity(
+export function hasMatchingOAuthIdentity(
   existing: Pick<OAuthCredential, "accountId" | "email">,
   incoming: Pick<OAuthCredential, "accountId" | "email">,
 ): boolean {
@@ -166,15 +169,29 @@ export function shouldBootstrapFromExternalCliCredential(params: {
 export function overlayRuntimeExternalOAuthProfiles(
   store: AuthProfileStore,
   profiles: Iterable<RuntimeExternalOAuthProfile>,
+  options?: { runtimeExternalProfileIdsAuthoritative?: boolean },
 ): AuthProfileStore {
   const externalProfiles = Array.from(profiles);
-  if (externalProfiles.length === 0) {
-    return store;
-  }
-  const next = structuredClone(store);
+  const next = cloneAuthProfileStore(store);
   for (const profile of externalProfiles) {
     next.profiles[profile.profileId] = profile.credential;
   }
+  const runtimeOnlyProfileIds = new Set(
+    externalProfiles
+      .filter((profile) => profile.persistence !== "persisted")
+      .map((profile) => profile.profileId),
+  );
+  for (const profileId of store.runtimeExternalProfileIds ?? []) {
+    if (next.profiles[profileId]) {
+      runtimeOnlyProfileIds.add(profileId);
+    }
+  }
+  next.runtimeExternalProfileIds =
+    runtimeOnlyProfileIds.size > 0 || options?.runtimeExternalProfileIdsAuthoritative === true
+      ? [...runtimeOnlyProfileIds].toSorted()
+      : undefined;
+  next.runtimeExternalProfileIdsAuthoritative =
+    options?.runtimeExternalProfileIdsAuthoritative === true ? true : undefined;
   return next;
 }
 

@@ -1,9 +1,16 @@
 import type { Command } from "commander";
+import { uniqueStrings } from "../../shared/string-normalization.js";
 import { removeCommandByName } from "./command-tree.js";
 import { registerLazyCommand } from "./register-lazy-command.js";
 
 export type CommandGroupPlaceholder = {
   name: string;
+  description: string;
+  options?: readonly CommandGroupPlaceholderOption[];
+};
+
+export type CommandGroupPlaceholderOption = {
+  flags: string;
   description: string;
 };
 
@@ -53,7 +60,8 @@ export function registerLazyCommandGroup(
     program,
     name: placeholder.name,
     description: placeholder.description,
-    removeNames: [...new Set(getCommandGroupNames(entry))],
+    options: placeholder.options,
+    removeNames: uniqueStrings(getCommandGroupNames(entry)),
     register: async () => {
       await entry.register(program);
     },

@@ -7,9 +7,11 @@ import {
   resolveStorePath,
 } from "../../config/sessions/inbound.runtime.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
-import { buildAgentSessionKey, type RoutePeer } from "../../routing/resolve-route.js";
+import type { RoutePeer } from "../../routing/resolve-route.js";
 import { resolveAgentIdFromSessionKey } from "../../routing/session-key.js";
 import { normalizeLowercaseStringOrEmpty } from "../../shared/string-coerce.js";
+import { uniqueStrings } from "../../shared/string-normalization.js";
+import { buildOutboundBaseSessionKey } from "./base-session-key.js";
 import type { ResolvedMessagingTarget } from "./target-resolver.js";
 
 export type OutboundSessionRoute = {
@@ -49,11 +51,62 @@ function stripProviderPrefix(raw: string, channel: string): string {
 }
 
 function stripKindPrefix(raw: string): string {
-  return raw.replace(/^(user|channel|group|conversation|room|dm):/i, "").trim();
+  return raw.replace(/^(user|channel|group|conversation|room|dm|thread):/i, "").trim();
+}
+
+const FALLBACK_TARGET_KIND_PREFIXES: Array<{ kind: ChatType; pattern: RegExp }> = [
+  { kind: "direct", pattern: /^(user:|dm:)/i },
+  { kind: "channel", pattern: /^(channel:|conversation:|thread:)/i },
+  { kind: "group", pattern: /^(group:|room:)/i },
+];
+
+function normalizeInferredPeerKind(value: ChatType | undefined): ChatType | undefined {
+  return value === "direct" || value === "group" || value === "channel" ? value : undefined;
+}
+
+function inferPeerKindFromPlugin(params: {
+  plugin: ReturnType<typeof resolveOutboundChannelPlugin>;
+  targets: readonly string[];
+}): ChatType | undefined {
+  for (const target of params.targets) {
+    const inferred = normalizeInferredPeerKind(
+      params.plugin?.messaging?.inferTargetChatType?.({ to: target }),
+    );
+    if (inferred) {
+      return inferred;
+    }
+  }
+  return undefined;
+}
+
+function inferPeerKindFromLegacyParser(params: {
+  plugin: ReturnType<typeof resolveOutboundChannelPlugin>;
+  targets: readonly string[];
+}): ChatType | undefined {
+  for (const target of params.targets) {
+    const parsed = params.plugin?.messaging?.parseExplicitTarget?.({ raw: target });
+    const inferred = normalizeInferredPeerKind(parsed?.chatType);
+    if (inferred) {
+      return inferred;
+    }
+  }
+  return undefined;
+}
+
+function inferPeerKindFromFallbackPrefixes(targets: readonly string[]): ChatType | undefined {
+  for (const target of targets) {
+    for (const fallback of FALLBACK_TARGET_KIND_PREFIXES) {
+      if (fallback.pattern.test(target)) {
+        return fallback.kind;
+      }
+    }
+  }
+  return undefined;
 }
 
 function inferPeerKind(params: {
   channel: ChannelId;
+  target: string;
   resolvedTarget?: ResolvedMessagingTarget;
 }): ChatType {
   const resolvedKind = params.resolvedTarget?.kind;
@@ -73,24 +126,15 @@ function inferPeerKind(params: {
     }
     return "group";
   }
-  return "direct";
-}
-
-function buildBaseSessionKey(params: {
-  cfg: OpenClawConfig;
-  agentId: string;
-  channel: ChannelId;
-  accountId?: string | null;
-  peer: RoutePeer;
-}): string {
-  return buildAgentSessionKey({
-    agentId: params.agentId,
-    channel: params.channel,
-    accountId: params.accountId,
-    peer: params.peer,
-    dmScope: params.cfg.session?.dmScope ?? "main",
-    identityLinks: params.cfg.session?.identityLinks,
-  });
+  const plugin = resolveOutboundChannelPlugin(params.channel);
+  const strippedTarget = stripProviderPrefix(params.target, params.channel).trim();
+  const targets = uniqueStrings([params.target, strippedTarget].filter(Boolean));
+  return (
+    inferPeerKindFromPlugin({ plugin, targets }) ??
+    inferPeerKindFromLegacyParser({ plugin, targets }) ??
+    inferPeerKindFromFallbackPrefixes(targets) ??
+    "direct"
+  );
 }
 
 function resolveFallbackSession(
@@ -102,6 +146,7 @@ function resolveFallbackSession(
   }
   const peerKind = inferPeerKind({
     channel: params.channel,
+    target: params.target,
     resolvedTarget: params.resolvedTarget,
   });
   const peerId = stripKindPrefix(trimmed);
@@ -109,7 +154,7 @@ function resolveFallbackSession(
     return null;
   }
   const peer: RoutePeer = { kind: peerKind, id: peerId };
-  const baseSessionKey = buildBaseSessionKey({
+  const baseSessionKey = buildOutboundBaseSessionKey({
     cfg: params.cfg,
     agentId: params.agentId,
     channel: params.channel,

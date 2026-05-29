@@ -57,8 +57,7 @@ describe("scanOpenRouterModels", () => {
     ]);
 
     const [byPricing] = results;
-    expect(byPricing).toBeTruthy();
-    if (!byPricing) {
+    if (byPricing === undefined) {
       throw new Error("Expected pricing-based model result.");
     }
     expect(byPricing.supportsToolsMeta).toBe(true);
@@ -81,7 +80,29 @@ describe("scanOpenRouterModels", () => {
     });
   });
 
-  it("matches provider filters across canonical provider aliases", async () => {
+  it("applies the scan timeout to the OpenRouter catalog request", async () => {
+    const fetchImpl: typeof fetch = async (_input, init) =>
+      await new Promise<Response>((_resolve, reject) => {
+        const signal = typeof init === "object" && init ? init.signal : undefined;
+        if (signal?.aborted) {
+          reject(new Error("catalog aborted"));
+          return;
+        }
+        signal?.addEventListener("abort", () => reject(new Error("catalog aborted")), {
+          once: true,
+        });
+      });
+
+    await expect(
+      scanOpenRouterModels({
+        fetchImpl,
+        probe: false,
+        timeoutMs: 1,
+      }),
+    ).rejects.toThrow(/catalog aborted/);
+  });
+
+  it("does not match provider filters across provider id variants", async () => {
     const fetchImpl = createFetchFixture({
       data: [
         {
@@ -109,6 +130,6 @@ describe("scanOpenRouterModels", () => {
       providerFilter: "z-ai",
     });
 
-    expect(results.map((entry) => entry.id)).toEqual(["z.ai/glm-5"]);
+    expect(results.map((entry) => entry.id)).toEqual([]);
   });
 });

@@ -44,6 +44,7 @@ export type AcpInitializeSessionInput = {
   agent: string;
   mode: AcpRuntimeSessionMode;
   resumeSessionId?: string;
+  runtimeOptions?: Partial<AcpSessionRuntimeOptions>;
   cwd?: string;
   backendId?: string;
 };
@@ -61,7 +62,13 @@ export type AcpRunTurnInput = {
   mode: AcpRuntimePromptMode;
   requestId: string;
   signal?: AbortSignal;
+  onLifecycle?: (event: AcpTurnLifecycleEvent) => Promise<void> | void;
   onEvent?: (event: AcpRuntimeEvent) => Promise<void> | void;
+};
+
+export type AcpTurnLifecycleEvent = {
+  type: "prompt_submitted";
+  at: number;
 };
 
 export type AcpCloseSessionInput = {

@@ -5,7 +5,7 @@ import { ensureUrbitChannelOpen, pokeUrbitChannel, scryUrbitPath } from "./chann
 import { getUrbitContext, normalizeUrbitCookie } from "./context.js";
 import { urbitFetch } from "./fetch.js";
 
-export type UrbitSseLogger = {
+type UrbitSseLogger = {
   log?: (message: string) => void;
   error?: (message: string) => void;
 };
@@ -22,6 +22,23 @@ type UrbitSseOptions = {
   maxReconnectDelay?: number;
   logger?: UrbitSseLogger;
 };
+
+function parseUrbitSsePayload(data: string): { id?: number; json?: unknown; response?: string } {
+  try {
+    return JSON.parse(data) as { id?: number; json?: unknown; response?: string };
+  } catch (cause) {
+    throw new Error("Tlon Urbit SSE event was malformed JSON", { cause });
+  }
+}
+
+function parseUrbitSseEventId(value: string): number | null {
+  const trimmed = value.trim();
+  if (!/^\d+$/.test(trimmed)) {
+    return null;
+  }
+  const parsed = Number(trimmed);
+  return Number.isSafeInteger(parsed) ? parsed : null;
+}
 
 export class UrbitSSEClient {
   url: string;
@@ -76,6 +93,18 @@ export class UrbitSSEClient {
     this.ssrfPolicy = options.ssrfPolicy;
     this.lookupFn = options.lookupFn;
     this.fetchImpl = options.fetchImpl;
+  }
+
+  private channelRequestContext() {
+    return {
+      baseUrl: this.url,
+      cookie: this.cookie,
+      ship: this.ship,
+      channelId: this.channelId,
+      ssrfPolicy: this.ssrfPolicy,
+      lookupFn: this.lookupFn,
+      fetchImpl: this.fetchImpl,
+    };
   }
 
   async subscribe(params: {
@@ -133,21 +162,10 @@ export class UrbitSSEClient {
   }
 
   async connect() {
-    await ensureUrbitChannelOpen(
-      {
-        baseUrl: this.url,
-        cookie: this.cookie,
-        ship: this.ship,
-        channelId: this.channelId,
-        ssrfPolicy: this.ssrfPolicy,
-        lookupFn: this.lookupFn,
-        fetchImpl: this.fetchImpl,
-      },
-      {
-        createBody: this.subscriptions,
-        createAuditContext: "tlon-urbit-channel-create",
-      },
-    );
+    await ensureUrbitChannelOpen(this.channelRequestContext(), {
+      createBody: this.subscriptions,
+      createAuditContext: "tlon-urbit-channel-create",
+    });
 
     await this.openStream();
     this.isConnected = true;
@@ -221,8 +239,8 @@ export class UrbitSSEClient {
         buffer += chunk.toString();
         let eventEnd;
         while ((eventEnd = buffer.indexOf("\n\n")) !== -1) {
-          const eventData = buffer.substring(0, eventEnd);
-          buffer = buffer.substring(eventEnd + 2);
+          const eventData = buffer.slice(0, eventEnd);
+          buffer = buffer.slice(eventEnd + 2);
           this.processEvent(eventData);
         }
       }
@@ -248,10 +266,10 @@ export class UrbitSSEClient {
 
     for (const line of lines) {
       if (line.startsWith("id: ")) {
-        eventId = parseInt(line.substring(4), 10);
+        eventId = parseUrbitSseEventId(line.slice(4));
       }
       if (line.startsWith("data: ")) {
-        data = line.substring(6);
+        data = line.slice(6);
       }
     }
 
@@ -260,7 +278,7 @@ export class UrbitSSEClient {
     }
 
     // Track event ID and send ack if needed
-    if (eventId !== null && !isNaN(eventId)) {
+    if (eventId !== null && !Number.isNaN(eventId)) {
       if (eventId > this.lastHeardEventId) {
         this.lastHeardEventId = eventId;
         if (eventId - this.lastAcknowledgedEventId > this.ackThreshold) {
@@ -275,7 +293,7 @@ export class UrbitSSEClient {
     }
 
     try {
-      const parsed = JSON.parse(data) as { id?: number; json?: unknown; response?: string };
+      const parsed = parseUrbitSsePayload(data);
 
       if (parsed.response === "quit") {
         if (parsed.id) {
@@ -305,18 +323,10 @@ export class UrbitSSEClient {
   }
 
   async poke(params: { app: string; mark: string; json: unknown }) {
-    return await pokeUrbitChannel(
-      {
-        baseUrl: this.url,
-        cookie: this.cookie,
-        ship: this.ship,
-        channelId: this.channelId,
-        ssrfPolicy: this.ssrfPolicy,
-        lookupFn: this.lookupFn,
-        fetchImpl: this.fetchImpl,
-      },
-      { ...params, auditContext: "tlon-urbit-poke" },
-    );
+    return await pokeUrbitChannel(this.channelRequestContext(), {
+      ...params,
+      auditContext: "tlon-urbit-poke",
+    });
   }
 
   async scry(path: string) {
@@ -383,7 +393,7 @@ export class UrbitSSEClient {
 
     this.reconnectAttempts += 1;
     const delay = Math.min(
-      this.reconnectDelay * Math.pow(2, this.reconnectAttempts - 1),
+      this.reconnectDelay * 2 ** (this.reconnectAttempts - 1),
       this.maxReconnectDelay,
     );
 

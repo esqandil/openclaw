@@ -1,4 +1,4 @@
-import { loadConfig } from "../../config/config.js";
+import { getRuntimeConfig } from "../../config/config.js";
 import { resolveStorePath } from "../../config/sessions/paths.js";
 import { loadSessionStore } from "../../config/sessions/store-load.js";
 import { resolveAllAgentSessionStoreTargets } from "../../config/sessions/targets.js";
@@ -54,7 +54,7 @@ export function resolveSessionStorePathForAcp(params: {
   sessionKey: string;
   cfg?: OpenClawConfig;
 }): { cfg: OpenClawConfig; storePath: string } {
-  const cfg = params.cfg ?? loadConfig();
+  const cfg = params.cfg ?? getRuntimeConfig();
   const parsed = parseAgentSessionKey(params.sessionKey);
   const storePath = resolveStorePath(cfg.session?.store, {
     agentId: parsed?.agentId,
@@ -65,6 +65,7 @@ export function resolveSessionStorePathForAcp(params: {
 export function readAcpSessionEntry(params: {
   sessionKey: string;
   cfg?: OpenClawConfig;
+  clone?: boolean;
 }): AcpSessionStoreEntry | null {
   const sessionKey = params.sessionKey.trim();
   if (!sessionKey) {
@@ -77,7 +78,7 @@ export function readAcpSessionEntry(params: {
   let store: Record<string, SessionEntry>;
   let storeReadFailed = false;
   try {
-    store = loadSessionStore(storePath);
+    store = loadSessionStore(storePath, params.clone === false ? { clone: false } : undefined);
   } catch {
     storeReadFailed = true;
     store = {};
@@ -99,7 +100,7 @@ export async function listAcpSessionEntries(params: {
   cfg?: OpenClawConfig;
   env?: NodeJS.ProcessEnv;
 }): Promise<AcpSessionStoreEntry[]> {
-  const cfg = params.cfg ?? loadConfig();
+  const cfg = params.cfg ?? getRuntimeConfig();
   const storeTargets = await resolveAllAgentSessionStoreTargets(
     cfg,
     params.env ? { env: params.env } : undefined,
@@ -135,6 +136,8 @@ export async function listAcpSessionEntries(params: {
 export async function upsertAcpSessionMeta(params: {
   sessionKey: string;
   cfg?: OpenClawConfig;
+  skipMaintenance?: boolean;
+  takeCacheOwnership?: boolean;
   mutate: (
     current: SessionAcpMeta | undefined,
     entry: SessionEntry | undefined,
@@ -174,6 +177,8 @@ export async function upsertAcpSessionMeta(params: {
     {
       activeSessionKey: normalizeLowercaseStringOrEmpty(sessionKey),
       allowDropAcpMetaSessionKeys: [sessionKey],
+      ...(params.skipMaintenance === true ? { skipMaintenance: true } : {}),
+      ...(params.takeCacheOwnership === true ? { takeCacheOwnership: true } : {}),
     },
   );
 }

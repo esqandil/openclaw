@@ -69,18 +69,17 @@ describe("model auth markers", () => {
     expect(isNonSecretApiKeyMarker(resolveOAuthApiKeyMarker("chutes"))).toBe(true);
     expect(isNonSecretApiKeyMarker("ollama-local")).toBe(true);
     expect(isNonSecretApiKeyMarker("lmstudio-local")).toBe(true);
+    expect(isNonSecretApiKeyMarker("codex-app-server")).toBe(true);
     expect(isNonSecretApiKeyMarker(GCP_VERTEX_CREDENTIALS_MARKER)).toBe(true);
   });
 
   it("reads bundled plugin-owned non-secret markers from manifests", () => {
-    expect(listKnownNonSecretApiKeyMarkers()).toEqual(
-      expect.arrayContaining([
-        "gcp-vertex-credentials",
-        "lmstudio-local",
-        "minimax-oauth",
-        "ollama-local",
-      ]),
-    );
+    const markers = new Set(listKnownNonSecretApiKeyMarkers());
+    expect(markers.has("codex-app-server")).toBe(true);
+    expect(markers.has("gcp-vertex-credentials")).toBe(true);
+    expect(markers.has("lmstudio-local")).toBe(true);
+    expect(markers.has("minimax-oauth")).toBe(true);
+    expect(markers.has("ollama-local")).toBe(true);
   });
 
   it("does not treat removed provider markers as active auth markers", () => {
