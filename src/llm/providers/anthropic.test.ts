@@ -193,4 +193,48 @@ describe("Anthropic provider", () => {
       effort: "high",
     });
   });
+
+  it.each([
+    ["claude-opus-4-7", undefined, "low", undefined],
+    ["claude-opus-4-7", "low", "medium", { type: "adaptive", display: "summarized" }],
+    ["claude-opus-4-7", "medium", "high", { type: "adaptive", display: "summarized" }],
+    ["claude-opus-4-7", "high", "xhigh", { type: "adaptive", display: "summarized" }],
+    ["claude-opus-4-7", "max", "max", { type: "adaptive", display: "summarized" }],
+    ["claude-opus-4-8", undefined, "low", undefined],
+    ["claude-opus-4-8", "low", "medium", { type: "adaptive", display: "summarized" }],
+    ["claude-opus-4-8", "medium", "high", { type: "adaptive", display: "summarized" }],
+    ["claude-opus-4-8", "high", "xhigh", { type: "adaptive", display: "summarized" }],
+    ["claude-opus-4-8", "max", "max", { type: "adaptive", display: "summarized" }],
+  ] as const)(
+    "maps %s thinking %s to adaptive effort %s without sampling params or budgets",
+    async (modelId, reasoning, effort, thinking) => {
+      let capturedPayload: unknown;
+      const stream = streamSimpleAnthropic(
+        makeAnthropicModel({
+          id: modelId,
+          name: modelId,
+          thinkingLevelMap: { xhigh: "xhigh", max: "max" },
+        }),
+        {
+          messages: [{ role: "user", content: "hello", timestamp: 0 }],
+        },
+        {
+          apiKey: "sk-ant-provider",
+          temperature: 0.2,
+          ...(reasoning ? { reasoning } : {}),
+          onPayload: (payload) => {
+            capturedPayload = payload;
+          },
+        },
+      );
+
+      await stream.result();
+
+      const payload = capturedPayload as Record<string, unknown>;
+      expect(payload.thinking).toEqual(thinking);
+      expect(payload.output_config).toEqual({ effort });
+      expect(payload).not.toHaveProperty("temperature");
+      expect(JSON.stringify(payload)).not.toContain("budget_tokens");
+    },
+  );
 });

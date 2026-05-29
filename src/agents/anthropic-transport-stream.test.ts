@@ -1938,4 +1938,44 @@ describe("anthropic transport stream", () => {
     expect(payload.thinking).toEqual({ type: "adaptive" });
     expect(payload.output_config).toEqual({ effort: "high" });
   });
+
+  it.each([
+    ["claude-opus-4-7", undefined, "low", undefined],
+    ["claude-opus-4-7", "low", "medium", { type: "adaptive" }],
+    ["claude-opus-4-7", "medium", "high", { type: "adaptive" }],
+    ["claude-opus-4-7", "high", "xhigh", { type: "adaptive" }],
+    ["claude-opus-4-7", "max", "max", { type: "adaptive" }],
+    ["claude-opus-4-8", undefined, "low", undefined],
+    ["claude-opus-4-8", "low", "medium", { type: "adaptive" }],
+    ["claude-opus-4-8", "medium", "high", { type: "adaptive" }],
+    ["claude-opus-4-8", "high", "xhigh", { type: "adaptive" }],
+    ["claude-opus-4-8", "max", "max", { type: "adaptive" }],
+  ] as const)(
+    "maps %s thinking %s to adaptive effort %s without sampling params or budgets",
+    async (modelId, reasoning, effort, thinking) => {
+      const model = makeAnthropicTransportModel({
+        id: modelId,
+        name: modelId,
+        maxTokens: 8192,
+      });
+
+      await runTransportStream(
+        model,
+        {
+          messages: [{ role: "user", content: "hello" }],
+        } as AnthropicStreamContext,
+        {
+          apiKey: "sk-ant-api",
+          temperature: 0.2,
+          ...(reasoning ? { reasoning } : {}),
+        } as AnthropicStreamOptions,
+      );
+
+      const payload = latestAnthropicRequest().payload;
+      expect(payload.thinking).toEqual(thinking);
+      expect(payload.output_config).toEqual({ effort });
+      expect(payload).not.toHaveProperty("temperature");
+      expect(JSON.stringify(payload)).not.toContain("budget_tokens");
+    },
+  );
 });

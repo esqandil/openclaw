@@ -737,6 +737,15 @@ function supportsAdaptiveThinking(modelId: string): boolean {
   );
 }
 
+function isClaudeOpus47OrNewerModel(modelId: string): boolean {
+  return (
+    modelId.includes("opus-4-8") ||
+    modelId.includes("opus-4.8") ||
+    modelId.includes("opus-4-7") ||
+    modelId.includes("opus-4.7")
+  );
+}
+
 /**
  * Map ThinkingLevel to Anthropic effort levels for adaptive thinking.
  * Model metadata owns the provider-specific extended effort mapping.
@@ -749,6 +758,23 @@ function mapThinkingLevelToEffort(
   const mapped = clampedLevel ? model.thinkingLevelMap?.[clampedLevel] : undefined;
   if (typeof mapped === "string") {
     return mapped as AnthropicEffort;
+  }
+
+  if (isClaudeOpus47OrNewerModel(model.id)) {
+    switch (clampedLevel) {
+      case "minimal":
+      case "low":
+        return "medium";
+      case "medium":
+        return "high";
+      case "high":
+      case "xhigh":
+        return "xhigh";
+      case "max":
+        return "max";
+      default:
+        return "low";
+    }
   }
 
   switch (clampedLevel) {
@@ -781,6 +807,7 @@ export const streamSimpleAnthropic: StreamFunction<"anthropic-messages", SimpleS
     return streamAnthropic(model, context, {
       ...base,
       thinkingEnabled: false,
+      effort: isClaudeOpus47OrNewerModel(model.id) ? "low" : undefined,
     } satisfies AnthropicOptions);
   }
 
@@ -968,8 +995,12 @@ function buildParams(
     ];
   }
 
-  // Temperature is incompatible with extended thinking (adaptive or budget-based).
-  if (options?.temperature !== undefined && !options?.thinkingEnabled) {
+  // Claude Opus 4.7+ rejects sampling params even when thinking is off.
+  const allowsTemperature =
+    options?.temperature !== undefined &&
+    !options?.thinkingEnabled &&
+    !isClaudeOpus47OrNewerModel(model.id);
+  if (allowsTemperature) {
     params.temperature = options.temperature;
   }
 
@@ -1011,7 +1042,18 @@ function buildParams(
         };
       }
     } else if (options?.thinkingEnabled === false) {
-      params.thinking = { type: "disabled" };
+      if (isClaudeOpus47OrNewerModel(model.id)) {
+        if (options.effort) {
+          params.output_config =
+            options.effort === "xhigh"
+              ? ({ effort: options.effort } as unknown as NonNullable<
+                  MessageCreateParamsStreaming["output_config"]
+                >)
+              : { effort: options.effort };
+        }
+      } else {
+        params.thinking = { type: "disabled" };
+      }
     }
   }
 

@@ -136,6 +136,23 @@ function supportsAdaptiveThinking(modelId: string): boolean {
 }
 
 function mapThinkingLevelToEffort(level: ThinkingLevel, modelId: string): AnthropicAdaptiveEffort {
+  if (isClaudeOpus47OrNewerModel(modelId)) {
+    switch (level) {
+      case "minimal":
+      case "low":
+        return "medium";
+      case "medium":
+        return "high";
+      case "high":
+      case "xhigh":
+        return "xhigh";
+      case "max":
+        return "max";
+      default:
+        return "low";
+    }
+  }
+
   switch (level) {
     case "minimal":
     case "low":
@@ -838,7 +855,11 @@ function buildAnthropicParams(
       },
     ];
   }
-  if (options?.temperature !== undefined && !options.thinkingEnabled) {
+  if (
+    options?.temperature !== undefined &&
+    !options.thinkingEnabled &&
+    !isClaudeOpus47OrNewerModel(model.id)
+  ) {
     params.temperature = options.temperature;
   }
   if (context.tools) {
@@ -858,7 +879,13 @@ function buildAnthropicParams(
         };
       }
     } else if (options?.thinkingEnabled === false) {
-      params.thinking = { type: "disabled" };
+      if (isClaudeOpus47OrNewerModel(model.id)) {
+        if (options.effort) {
+          params.output_config = { effort: options.effort };
+        }
+      } else {
+        params.thinking = { type: "disabled" };
+      }
     }
   }
   if (options?.metadata && typeof options.metadata.user_id === "string") {
@@ -906,6 +933,9 @@ function resolveAnthropicTransportOptions(
   };
   if (!options?.reasoning) {
     resolved.thinkingEnabled = false;
+    if (isClaudeOpus47OrNewerModel(model.id)) {
+      resolved.effort = "low";
+    }
     return resolved;
   }
   if (supportsAdaptiveThinking(model.id)) {

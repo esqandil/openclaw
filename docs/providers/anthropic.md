@@ -164,6 +164,18 @@ Anthropic's current public docs:
 
 Claude Opus 4.8 keeps thinking off by default in OpenClaw. When you explicitly enable adaptive thinking with `/think high|xhigh|max`, OpenClaw sends Anthropic's Opus 4.8 effort values; Claude 4.6 models default to `adaptive`.
 
+Claude Opus 4.7 and 4.8 only support adaptive thinking, so OpenClaw maps its
+thinking levels to Anthropic `output_config.effort` instead of sending
+`budget_tokens`:
+
+| OpenClaw level | Anthropic request                                    |
+| -------------- | ---------------------------------------------------- |
+| `off`          | no `thinking`, `output_config.effort: "low"`         |
+| `low`          | `thinking: { type: "adaptive" }`, `effort: "medium"` |
+| `medium`       | `thinking: { type: "adaptive" }`, `effort: "high"`   |
+| `high`         | `thinking: { type: "adaptive" }`, `effort: "xhigh"`  |
+| `max`          | `thinking: { type: "adaptive" }`, `effort: "max"`    |
+
 Override per-message with `/think:<level>` or in model params:
 
 ```json5
