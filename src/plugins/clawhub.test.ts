@@ -75,7 +75,8 @@ vi.mock("../infra/archive.js", async () => {
 
 const { ClawHubRequestError } = await import("../infra/clawhub-client.js");
 type ClawHubResolvedArtifact = import("../infra/clawhub-packages.js").ClawHubResolvedArtifact;
-const { CLAWHUB_INSTALL_ERROR_CODE, installPluginFromClawHub } = await import("./clawhub.js");
+const { CLAWHUB_INSTALL_ERROR_CODE, installPluginFromClawHub, resolveClawHubReleaseMetadata } =
+  await import("./clawhub.js");
 
 const DEMO_ARCHIVE_INTEGRITY = "sha256-qerEjGEpvES2+Tyan0j2xwDRkbcnmh4ZFfKN9vWbsa8=";
 const DEMO_ARCHIVE_SHA256 = "a9eac48c6129bc44b6f93c9a9f48f6c700d191b7279a1e1915f28df6f59bb1af";
@@ -2773,6 +2774,190 @@ describe("installPluginFromClawHub", () => {
     },
   ] as const)("$name", async ({ setup, spec, expected }) => {
     await expectClawHubInstallError({ setup, spec, expected });
+  });
+});
+
+describe("resolveClawHubReleaseMetadata", () => {
+  beforeEach(() => {
+    parseClawHubPluginSpecMock.mockReset();
+    fetchClawHubPackageDetailMock.mockReset();
+    fetchClawHubPackageArtifactMock.mockReset();
+    fetchClawHubPackageVersionMock.mockReset();
+    downloadClawHubPackageArchiveMock.mockReset();
+    resolveLatestVersionFromPackageMock.mockReset();
+    resolveCompatibilityHostVersionMock.mockReset();
+    installPluginFromArchiveMock.mockReset();
+  });
+
+  it("returns clawpackSha256 + npm* + official=true for official npm-pack artifact", async () => {
+    parseClawHubPluginSpecMock.mockReturnValue({ name: "@openclaw/slack", version: "2026.9.3" });
+    fetchClawHubPackageDetailMock.mockResolvedValue({
+      package: {
+        name: "@openclaw/slack",
+        channel: "official",
+        isOfficial: true,
+        compatibility: { minGatewayVersion: "2026.9.0" },
+        family: "code-plugin",
+      },
+    });
+    fetchClawHubPackageArtifactMock.mockResolvedValue({
+      version: { version: "2026.9.3", compatibility: { minGatewayVersion: "2026.9.0" } },
+      package: { family: "code-plugin" },
+      artifact: {
+        kind: "npm-pack",
+        sha256: "aa".repeat(32),
+        npmIntegrity: "sha512-..",
+        npmShasum: "bb".repeat(40),
+      },
+    });
+    resolveLatestVersionFromPackageMock.mockReturnValue("2026.9.3");
+    resolveCompatibilityHostVersionMock.mockReturnValue("2026.9.0");
+
+    const res = await resolveClawHubReleaseMetadata({ spec: "clawhub:@openclaw/slack@2026.9.3" });
+    expect(res.ok).toBe(true);
+    if (res.ok) {
+      expect(res.packageName).toBe("@openclaw/slack");
+      expect(res.version).toBe("2026.9.3");
+      expect(res.baseUrl).toBe("https://clawhub.ai");
+      expect(res.clawpackSha256).toBe("aa".repeat(32));
+      expect(res.npmIntegrity).toBe("sha512-..");
+      expect(res.npmShasum).toBe("bb".repeat(40));
+      expect(res.officialClawHubPackage).toBe(true);
+      expect(res.archiveIntegrity).toBe(null);
+      expect(res.detail).toBeDefined();
+    }
+  });
+
+  it("returns archiveIntegrity + clawpackSha256:null for legacy archive", async () => {
+    parseClawHubPluginSpecMock.mockReturnValue({ name: "demo", version: "1.0.0" });
+    fetchClawHubPackageDetailMock.mockResolvedValue({
+      package: {
+        name: "demo",
+        channel: "official",
+        isOfficial: true,
+        compatibility: { minGatewayVersion: "2026.9.0" },
+        family: "code-plugin",
+      },
+    });
+    fetchClawHubPackageArtifactMock.mockResolvedValue({
+      version: {
+        version: "1.0.0",
+        compatibility: { minGatewayVersion: "2026.9.0" },
+        sha256hash: DEMO_ARCHIVE_SHA256,
+      },
+      package: { family: "code-plugin" },
+    });
+    resolveLatestVersionFromPackageMock.mockReturnValue("1.0.0");
+    resolveCompatibilityHostVersionMock.mockReturnValue("2026.9.0");
+
+    const res = await resolveClawHubReleaseMetadata({ spec: "clawhub:demo@1.0.0" });
+    expect(res.ok).toBe(true);
+    if (res.ok) {
+      expect(res.packageName).toBe("demo");
+      expect(res.version).toBe("1.0.0");
+      expect(res.baseUrl).toBe("https://clawhub.ai");
+      expect(res.archiveIntegrity).toBe(DEMO_ARCHIVE_INTEGRITY);
+      expect(res.clawpackSha256).toBe(null);
+      expect(res.officialClawHubPackage).toBe(true);
+      expect(res.detail).toBeDefined();
+    }
+  });
+
+  it("returns failure for incompatible host version (same path as install)", async () => {
+    parseClawHubPluginSpecMock.mockReturnValue({ name: "demo", version: "1.0.0" });
+    fetchClawHubPackageDetailMock.mockResolvedValue({
+      package: {
+        name: "demo",
+        compatibility: { minGatewayVersion: "999.0.0" },
+        family: "code-plugin",
+      },
+    });
+    fetchClawHubPackageArtifactMock.mockResolvedValue({
+      version: { version: "1.0.0" },
+      package: { family: "code-plugin" },
+    });
+    resolveLatestVersionFromPackageMock.mockReturnValue("1.0.0");
+    resolveCompatibilityHostVersionMock.mockReturnValue("1.0.0"); // too old
+
+    const res = await resolveClawHubReleaseMetadata({ spec: "clawhub:demo@1.0.0" });
+    expect(res.ok).toBe(false);
+    expect((res as any).code).toBe(CLAWHUB_INSTALL_ERROR_CODE.INCOMPATIBLE_GATEWAY);
+  });
+
+  it("returns ARTIFACT_UNAVAILABLE failure when no artifact metadata", async () => {
+    parseClawHubPluginSpecMock.mockReturnValue({ name: "demo", version: "1.0.0" });
+    fetchClawHubPackageDetailMock.mockResolvedValue({
+      package: { name: "demo", family: "code-plugin" },
+    });
+    fetchClawHubPackageArtifactMock.mockResolvedValue({
+      version: { version: "1.0.0" },
+      package: { family: "code-plugin" },
+      artifact: null,
+    });
+    resolveLatestVersionFromPackageMock.mockReturnValue("1.0.0");
+    resolveCompatibilityHostVersionMock.mockReturnValue("2026.9.0");
+
+    const res = await resolveClawHubReleaseMetadata({ spec: "clawhub:demo@1.0.0" });
+    expect(res.ok).toBe(false);
+    expect((res as any).code).toBe(CLAWHUB_INSTALL_ERROR_CODE.ARTIFACT_UNAVAILABLE);
+  });
+
+  it("asserts no archive download and no Downloading/Extracting logger side effects", async () => {
+    parseClawHubPluginSpecMock.mockReturnValue({ name: "@openclaw/slack", version: "2026.9.3" });
+    fetchClawHubPackageDetailMock.mockResolvedValue({
+      package: {
+        name: "@openclaw/slack",
+        channel: "official",
+        isOfficial: true,
+        compatibility: { minGatewayVersion: "2026.9.0" },
+        family: "code-plugin",
+      },
+    });
+    fetchClawHubPackageArtifactMock.mockResolvedValue({
+      version: { version: "2026.9.3", compatibility: { minGatewayVersion: "2026.9.0" } },
+      package: { family: "code-plugin" },
+      artifact: {
+        kind: "npm-pack",
+        sha256: "aa".repeat(32),
+        npmIntegrity: "sha512-..",
+        npmShasum: "bb".repeat(40),
+      },
+    });
+    resolveLatestVersionFromPackageMock.mockReturnValue("2026.9.3");
+    resolveCompatibilityHostVersionMock.mockReturnValue("2026.9.0");
+
+    const logger = createLoggerSpies();
+    const res = await resolveClawHubReleaseMetadata({ spec: "clawhub:@openclaw/slack@2026.9.3" });
+    expect(res.ok).toBe(true);
+    expect(downloadClawHubPackageArchiveMock).not.toHaveBeenCalled();
+    expect(logger.info).not.toHaveBeenCalledWith(expect.stringContaining("Downloading"));
+    expect(logger.info).not.toHaveBeenCalledWith(expect.stringContaining("Extracting"));
+    expect(logger.warn).not.toHaveBeenCalledWith(expect.stringContaining("Downloading"));
+    expect(logger.warn).not.toHaveBeenCalledWith(expect.stringContaining("Extracting"));
+  });
+
+  it("returns failure for package/capabilities runtime-id mismatch (metadata-only resolver)", async () => {
+    parseClawHubPluginSpecMock.mockReturnValue({ name: "demo", version: "1.0.0" });
+    fetchClawHubPackageDetailMock.mockResolvedValue({
+      package: {
+        name: "demo",
+        family: "code-plugin",
+        runtimeId: "pkg-123",
+        capabilities: { runtimeId: "cap-456" },
+      },
+    });
+    fetchClawHubPackageArtifactMock.mockResolvedValue({
+      version: { version: "1.0.0" },
+      package: { family: "code-plugin" },
+    });
+    resolveLatestVersionFromPackageMock.mockReturnValue("1.0.0");
+    resolveCompatibilityHostVersionMock.mockReturnValue("2026.9.0");
+
+    const res = await resolveClawHubReleaseMetadata({ spec: "clawhub:demo@1.0.0" });
+    expect(res.ok).toBe(false);
+    expect((res as any).error).toContain("runtime id mismatch");
+    expect((res as any).code).toBeUndefined();
+    expect(downloadClawHubPackageArchiveMock).not.toHaveBeenCalled();
   });
 });
 /* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

@@ -551,6 +551,12 @@ export async function executeMutableUpdate(
           packageTransaction = transaction;
         },
         onConfigSnapshot,
+        postInstallDoctorPolicy:
+          !params.shouldRestart &&
+          preManagedServiceStop?.running === true &&
+          preManagedServiceStop.serviceUpdateVerdict?.kind === "owned"
+            ? "defer-live-managed-gateway"
+            : "run",
       };
       await recheckSchemas(params.packageTargetSchemaVersions);
       result = await runPackageInstallUpdate(packageUpdate);

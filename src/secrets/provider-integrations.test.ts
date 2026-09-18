@@ -152,6 +152,7 @@ describe("secret provider integration presets", () => {
         },
         trustedDirs: [path.dirname(process.execPath), rootDir],
         jsonOnly: false,
+        _fromTrustedPluginIntegration: true,
       },
     });
   });
@@ -199,6 +200,7 @@ describe("secret provider integration presets", () => {
         args: [fs.realpathSync(path.join(rootDir, "resolve.mjs")), "ok"],
         trustedDirs: [path.dirname(process.execPath), rootDir],
         passEnv: ["GOOD_ENV"],
+        _fromTrustedPluginIntegration: true,
       },
     });
   });

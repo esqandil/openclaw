@@ -188,6 +188,21 @@ function resolveConfiguredProvider(params: {
     }
     return resolved.providerConfig;
   }
+
+  // Defense-in-depth: strip any _fromTrustedPluginIntegration marker from non-plugin
+  // (i.e. manual) provider configs so that only materialized trusted plugin paths
+  // can ever trigger the root-ownership relaxation in path validation.
+  if (
+    providerConfig &&
+    typeof providerConfig === "object" &&
+    "_fromTrustedPluginIntegration" in providerConfig
+  ) {
+    const { _fromTrustedPluginIntegration: _ignored, ...clean } = providerConfig as Record<
+      string,
+      unknown
+    >;
+    return clean as SecretProviderConfig;
+  }
   return providerConfig;
 }
 
@@ -442,6 +457,8 @@ async function resolveExecRefs(params: {
       command: params.providerConfig.command,
       label: `secrets.providers.${params.providerName}.command`,
       trustedDirs: params.providerConfig.trustedDirs,
+      // eslint-disable-next-line no-underscore-dangle
+      fromTrustedPluginIntegration: params.providerConfig._fromTrustedPluginIntegration === true,
     });
   } catch (err) {
     throwUnknownProviderResolutionError({

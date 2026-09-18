@@ -356,6 +356,20 @@ export type ManualExecSecretProviderConfig = {
   env?: Record<string, string>;
   passEnv?: string[];
   trustedDirs?: string[];
+  /**
+   * Runtime-only provenance marker. Populated exclusively by
+   * resolveSecretProviderIntegrationConfig / materializeExecProviderConfig
+   * for trusted bundled/global plugin secret-provider integrations
+   * (the "${node}" case). Never appears in user-persisted manual
+   * exec provider configs.
+   *
+   * - CLI config validation rejects manual providers carrying this marker.
+   * - Runtime exec resolution forwards it to assertSecureExecCommandPath
+   *   so that root-owned Node binaries (e.g. /usr/bin/node from distro package)
+   *   are accepted ONLY for these materialized trusted integrations.
+   * - Manual exec providers and non-plugin paths remain strictly current-uid owned.
+   */
+  _fromTrustedPluginIntegration?: true;
 };
 
 export type PluginIntegrationSecretProviderConfig = {

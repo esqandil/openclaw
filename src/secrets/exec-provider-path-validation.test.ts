@@ -1,7 +1,8 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import * as permissions from "../infra/permissions.js";
 import { withMockedWindowsAclVerificationUnavailable } from "../test-utils/vitest-spies.js";
 import { assertSecureExecCommandPath } from "./exec-provider-path-validation.js";
 
@@ -150,4 +151,98 @@ describe("exec provider command path validation", () => {
       },
     );
   });
+
+  itPosix(
+    "accepts root-owned command (uid=0) when fromTrustedPluginIntegration marker is true (trusted bundled ${node} plugin case)",
+    async () => {
+      const spy = vi.spyOn(permissions, "safeStat").mockResolvedValue({
+        ok: true,
+        isDir: false,
+        isSymlink: false,
+        uid: 0,
+        gid: 0,
+      } as any);
+      try {
+        const securePath = await assertSecureExecCommandPath({
+          command: validExecutablePath,
+          label: "secrets.providers.myplugin.command",
+          trustedDirs: [path.dirname(validExecutablePath)],
+          fromTrustedPluginIntegration: true,
+        });
+        expect(securePath).toBe(validExecutablePath);
+      } finally {
+        spy.mockRestore();
+      }
+    },
+  );
+
+  itPosix(
+    "rejects root-owned command for manual exec config (marker false or absent)",
+    async () => {
+      const spy = vi.spyOn(permissions, "safeStat").mockResolvedValue({
+        ok: true,
+        isDir: false,
+        isSymlink: false,
+        uid: 0,
+        gid: 0,
+      } as any);
+      try {
+        await expect(
+          assertSecureExecCommandPath({
+            command: validExecutablePath,
+            label: "secrets.providers.manual.command",
+            fromTrustedPluginIntegration: false,
+          }),
+        ).rejects.toThrow("must be owned by the current user");
+
+        // absent marker also rejects (manual default)
+        await expect(
+          assertSecureExecCommandPath({
+            command: validExecutablePath,
+            label: "secrets.providers.manual.command",
+          }),
+        ).rejects.toThrow("must be owned by the current user");
+      } finally {
+        spy.mockRestore();
+      }
+    },
+  );
+
+  itPosix("accepts current-user-owned command for manual exec config", async () => {
+    const securePath = await assertSecureExecCommandPath({
+      command: validExecutablePath,
+      label: "secrets.providers.userowned.command",
+    });
+    expect(securePath).toBe(validExecutablePath);
+  });
+
+  itPosix("still rejects symlinked command paths even with trusted plugin marker", async () => {
+    const root = await createCaseDir("link-trusted-marker");
+    const symlinkPath = path.join(root, "exec-link");
+    await fs.symlink(validExecutablePath, symlinkPath);
+    await expect(
+      assertSecureExecCommandPath({
+        command: symlinkPath,
+        label: "secrets.providers.trustedplugin.command",
+        fromTrustedPluginIntegration: true,
+      }),
+    ).rejects.toThrow("must not be a symlink");
+  });
+
+  itPosix(
+    "still rejects world-writable command paths even with trusted plugin marker",
+    async () => {
+      const root = await createCaseDir("writable-trusted-marker");
+      const scriptPath = path.join(root, "helper");
+      await fs.writeFile(scriptPath, "#!/bin/sh\nexit 0\n");
+      await fs.chmod(scriptPath, 0o666);
+      await expect(
+        assertSecureExecCommandPath({
+          command: scriptPath,
+          label: "secrets.providers.trustedplugin.command",
+          fromTrustedPluginIntegration: true,
+        }),
+      ).rejects.toThrow("permissions are too open");
+    },
+  );
 });

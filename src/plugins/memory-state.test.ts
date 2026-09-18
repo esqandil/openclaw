@@ -469,6 +469,77 @@ describe("memory plugin state", () => {
     expect(scoped.memoryPromptSupplements).toEqual([]);
   });
 
+  it("adopts when target absent (root-owned sidecar case)", () => {
+    const supplement = { search: async () => [], get: async () => null };
+    const prepare = async () => ["prep"];
+    const builder = () => ["build"];
+    const root = createEmptyPluginRegistry();
+    root.plugins.push(
+      createPluginRecord({ id: "memory-wiki", source: "/root/wiki.js", status: "loaded" }),
+    );
+    root.memoryCorpusSupplements.push({ pluginId: "memory-wiki", supplement });
+    root.memoryPromptPreparations.push({ pluginId: "memory-wiki", prepare });
+    root.memoryPromptSupplements.push({ pluginId: "memory-wiki", builder });
+    const scoped = createEmptyPluginRegistry();
+    // no "memory-wiki" in scoped
+
+    const result = adoptRuntimeMemoryRegistrations(scoped, root, {
+      plugins: { allow: ["memory-wiki"], entries: { "memory-wiki": { enabled: true } } },
+    });
+    expect(result).not.toBe(scoped);
+    expect(result.memoryCorpusSupplements[0]?.supplement).toBe(supplement);
+  });
+
+  it("adopts when same source", () => {
+    const supplement = { search: async () => [], get: async () => null };
+    const root = createEmptyPluginRegistry();
+    root.plugins.push(
+      createPluginRecord({ id: "memory-wiki", source: "/root/wiki.js", status: "loaded" }),
+    );
+    root.memoryCorpusSupplements.push({ pluginId: "memory-wiki", supplement });
+    const scoped = createEmptyPluginRegistry();
+    scoped.plugins.push(
+      createPluginRecord({ id: "memory-wiki", source: "/root/wiki.js", status: "loaded" }),
+    );
+
+    const result = adoptRuntimeMemoryRegistrations(scoped, root, {
+      plugins: { entries: { "memory-wiki": { enabled: true } } },
+    });
+    expect(result.memoryCorpusSupplements[0]?.supplement).toBe(supplement);
+  });
+
+  it("skips when runtime owner not loaded in root", () => {
+    const supplement = { search: async () => [], get: async () => null };
+    const root = createEmptyPluginRegistry();
+    root.plugins.push(
+      createPluginRecord({ id: "memory-wiki", source: "/root/wiki.js", status: "error" }),
+    );
+    root.memoryCorpusSupplements.push({ pluginId: "memory-wiki", supplement });
+    const scoped = createEmptyPluginRegistry();
+
+    const result = adoptRuntimeMemoryRegistrations(scoped, root, {
+      plugins: { entries: { "memory-wiki": { enabled: true } } },
+    });
+    expect(result).toBe(scoped);
+    expect(result.memoryCorpusSupplements).toEqual([]);
+  });
+
+  it("skips memory adoption when config disabled", () => {
+    const supplement = { search: async () => [], get: async () => null };
+    const root = createEmptyPluginRegistry();
+    root.plugins.push(
+      createPluginRecord({ id: "memory-wiki", source: "/root/wiki.js", status: "loaded" }),
+    );
+    root.memoryCorpusSupplements.push({ pluginId: "memory-wiki", supplement });
+    const scoped = createEmptyPluginRegistry();
+
+    const result = adoptRuntimeMemoryRegistrations(scoped, root, {
+      plugins: { enabled: false },
+    });
+    expect(result).toBe(scoped);
+    expect(result.memoryCorpusSupplements).toEqual([]);
+  });
+
   it("clearMemoryPluginState resets both registries", () => {
     registerMemoryState({
       promptSection: ["stale section"],

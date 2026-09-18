@@ -5,10 +5,12 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { once } from "node:events";
+import { createWriteStream, openSync } from "node:fs";
 import fs from "node:fs/promises";
 import { Socket } from "node:net";
 import os from "node:os";
 import path from "node:path";
+import { sliceUtf16Safe } from "@openclaw/normalization-core/utf16-slice";
 import { formatCliCommand } from "../cli/command-format.js";
 import { formatInstallationTargetCommand } from "../cli/installation-target-format.js";
 import { resolveUpdatedInstallCommandEnv } from "../cli/update-cli/update-command-service-env.js";
@@ -20,10 +22,12 @@ import { resolveServiceManagerEnv } from "../daemon/service-process-env.js";
 import { findInstalledSystemdGatewayScope } from "../daemon/systemd-scope.js";
 import { resolveSystemdServiceName } from "../daemon/systemd-service-files.js";
 import { buildCliRespawnPlan } from "../entry.respawn.js";
+import { redactSensitiveText } from "../logging/redact.js";
 import { forceKillChildProcessTree } from "../process/child-process-tree.js";
 import { isPidAlive, getFileLockProcessStartTime } from "../shared/pid-alive.js";
 import { SKIPPED_UPDATE_OUTCOMES } from "../shared/update-outcome.js";
 import { resolveOpenClawStateSqlitePath } from "../state/openclaw-state-db.paths.js";
+import { hasErrnoCode, isErrno } from "./errno.js";
 import { resolveExecutableFromPathEnv } from "./executable-path.js";
 import { installationTargetEnv, resolveInstallationTarget } from "./installation-target-context.js";
 import { resolveNodeSqliteLocation } from "./node-sqlite.js";
@@ -56,6 +60,10 @@ import { looksLikeGitCheckout } from "./update-runner-install-surface.js";
 // The activation deadline covers Gateway drain plus this shutdown reserve.
 const PARENT_EXIT_SHUTDOWN_RESERVE_MS = 30_000;
 const HANDOFF_READY_TIMEOUT_MS = 30_000;
+const HANDOFF_STARTUP_LOG_TAIL_BYTES = 4096;
+const HANDOFF_STARTUP_LOG_TAIL_CHARS = 1024;
+const HANDOFF_STARTUP_FAILURE_MESSAGE_CHARS = 1024;
+const HANDOFF_STARTUP_FAILURE_CODE_PATTERN = /^[A-Z][A-Z0-9_]{0,63}$/u;
 const HANDOFF_READY_MARKER = "OPENCLAW_UPDATE_HANDOFF_READY\n";
 const HANDOFF_BUSY_MARKER = "HANDOFF_BUSY ";
 const HANDOFF_NOTICE_MARKER = "before-park\n";
@@ -2097,6 +2105,148 @@ function waitForHandoffResponse(child: HandoffChild, command?: string): Promise<
   });
 }
 
+/**
+ * Drop leading whole lines until the excerpt plus its final newline fits the
+ * retained byte budget. Redaction can grow text and an exact-budget read has no
+ * room for the newline, so the bound is enforced on the text actually written.
+ * A lone line that cannot fit yields nothing, matching the torn-tail rule.
+ */
+function fitHandoffStartupTail(text: string): string {
+  let tail = text;
+  while (tail && Buffer.byteLength(tail) + 1 > HANDOFF_STARTUP_LOG_TAIL_BYTES) {
+    const boundary = tail.indexOf("\n");
+    if (boundary < 0) {
+      return "";
+    }
+    tail = tail.slice(boundary + 1);
+  }
+  return tail;
+}
+
+/**
+ * Read a bounded, whole-line tail of the raw startup capture and redact it.
+ * Starting at a line boundary keeps a torn token fragment out of the excerpt;
+ * a truncated read with no line boundary yields nothing rather than a fragment
+ * whose cut-off prefix could defeat token redaction.
+ */
+async function readRedactedHandoffStartupTail(logPath: string): Promise<string> {
+  const handle = await fs.open(logPath, "r");
+  let tail: string;
+  try {
+    const { size } = await handle.stat();
+    const length = Math.min(size, HANDOFF_STARTUP_LOG_TAIL_BYTES);
+    const buffer = Buffer.alloc(length);
+    await handle.read(buffer, 0, length, size - length);
+    tail = buffer.toString("utf8");
+    if (length < size) {
+      const boundary = tail.indexOf("\n");
+      if (boundary < 0) {
+        return "";
+      }
+      tail = tail.slice(boundary + 1);
+    }
+  } finally {
+    await handle.close();
+  }
+  return fitHandoffStartupTail(redactSensitiveText(tail.trim(), { mode: "tools" }));
+}
+
+/**
+ * The script, params, meta, triage input, and staged runtime must be proven
+ * gone before any log may stay beside them. A removal that rejects, or a path
+ * that is still present afterwards, denies retention rather than trusting the
+ * removal call.
+ */
+async function removeHandoffStartupInputs(dir: string, sensitivePaths: string[]): Promise<boolean> {
+  const targets = [...sensitivePaths, path.join(dir, "runtime")];
+  try {
+    await Promise.all(targets.map((target) => fs.rm(target, { recursive: true, force: true })));
+    const present = await Promise.all(
+      targets.map((target) =>
+        fs.lstat(target).then(
+          () => true,
+          (statError: unknown) => !hasErrnoCode(statError, "ENOENT"),
+        ),
+      ),
+    );
+    return !present.includes(true);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Once the launcher runs, failures carry launcher- and helper-derived data
+ * (spawn arguments, stderr, lease state) into callers that log and display
+ * them, so the thrown value is rebuilt from scratch: a redacted, bounded
+ * message and an errno-shaped `code` (the ENOENT contract) are the only fields
+ * carried. Raw `cause`, stacks, and other custom properties stay behind.
+ */
+function toHandoffStartupFailure(err: unknown): Error {
+  const message =
+    err instanceof Error ? err.message : "managed update handoff failed before signaling readiness";
+  const failure = new Error(
+    sliceUtf16Safe(
+      redactSensitiveText(message, { mode: "tools" }),
+      0,
+      HANDOFF_STARTUP_FAILURE_MESSAGE_CHARS,
+    ),
+  );
+  if (
+    isErrno(err) &&
+    typeof err.code === "string" &&
+    HANDOFF_STARTUP_FAILURE_CODE_PATTERN.test(err.code)
+  ) {
+    Object.assign(failure, { code: err.code });
+  }
+  return failure;
+}
+
+/**
+ * A helper that dies before readiness leaves its only evidence in the scratch
+ * log (its stderr plus appendLog lines). That raw capture can echo secrets, so
+ * only a bounded, redacted tail of it survives: the scratch inputs go, the raw
+ * log is atomically replaced by the sanitized excerpt (kept for the stale
+ * sweep), and the launch failure names the cause. When the inputs cannot be
+ * proven gone or the excerpt cannot be produced or swapped in, the raw log and
+ * then the whole directory go instead, and no retention is advertised.
+ */
+async function retainHandoffStartupDiagnostics(
+  err: unknown,
+  dir: string,
+  logPath: string,
+  sensitivePaths: string[],
+): Promise<Error> {
+  const failure = toHandoffStartupFailure(err);
+  let retained = "";
+  if (await removeHandoffStartupInputs(dir, sensitivePaths)) {
+    try {
+      const excerpt = await readRedactedHandoffStartupTail(logPath);
+      if (excerpt) {
+        const excerptPath = `${logPath}.${randomUUID()}.redacted`;
+        await fs.writeFile(excerptPath, `${excerpt}\n`, { mode: 0o600, flag: "wx" });
+        await fs.rename(excerptPath, logPath);
+        retained = excerpt;
+      }
+    } catch {
+      retained = "";
+    }
+  }
+  if (!retained) {
+    // The raw log goes first so a directory removal that stalls on another
+    // entry still cannot leave the unredacted capture behind.
+    await fs.rm(logPath, { force: true }).catch(() => {});
+    await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
+    return failure;
+  }
+  const bounded =
+    retained.length > HANDOFF_STARTUP_LOG_TAIL_CHARS
+      ? `…${sliceUtf16Safe(retained, retained.length - HANDOFF_STARTUP_LOG_TAIL_CHARS)}`
+      : retained;
+  failure.message = `${failure.message}; redacted helper log tail retained at ${logPath}\n${bounded}`;
+  return failure;
+}
+
 async function spawnManagedServiceUpdateHandoff(
   params: ManagedServiceUpdateHandoffParams & { handoffId: string },
   rootIdentity: string,
@@ -2294,13 +2444,28 @@ async function spawnManagedServiceUpdateHandoff(
     await fs.writeFile(scriptPath, `${HANDOFF_SCRIPT}\n`, { mode: 0o700 });
     await fs.writeFile(paramsPath, `${JSON.stringify(helperParams, null, 2)}\n`, { mode: 0o600 });
     await fs.writeFile(metaPath, `${JSON.stringify(metaFile, null, 2)}\n`, { mode: 0o600 });
-
-    child = spawn(spawnCommand, spawnArgs, {
-      cwd: dir,
-      env,
-      detached: true,
-      stdio: ["pipe", "pipe", "ignore"],
-    });
+  } catch (err) {
+    // Nothing has run yet: this is the parent's own staging failure, with no
+    // helper capture to sanitize or retain. Test fixtures capture the staged
+    // script by throwing a sentinel here and expect that instance back.
+    await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
+    throw err;
+  }
+  try {
+    // The launcher (systemd-run) and helper report startup faults on stderr;
+    // the helper's own appendLog lines share this file. Spawn failures surface
+    // on the next tick, so no await may separate spawn from its listeners.
+    const helperLog = createWriteStream(logPath, { fd: openSync(logPath, "a", 0o600) });
+    try {
+      child = spawn(spawnCommand, spawnArgs, {
+        cwd: dir,
+        env,
+        detached: true,
+        stdio: ["pipe", "pipe", helperLog],
+      });
+    } finally {
+      helperLog.destroy();
+    }
     owner.launcher = child;
     child.stdin.on("error", () => child.stdin.destroy()).once("close", () => child.stdin.destroy());
     // Failed spawn handles are not processes and must never be signalled.
@@ -2343,8 +2508,7 @@ async function spawnManagedServiceUpdateHandoff(
     child?.removeListener("exit", onExit);
     child?.stdin.destroy();
     child?.stdout.destroy();
-    await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
-    throw err;
+    throw await retainHandoffStartupDiagnostics(err, dir, logPath, helperParams.sensitivePaths);
   }
   if (params.beforePark) {
     let buffered = "";

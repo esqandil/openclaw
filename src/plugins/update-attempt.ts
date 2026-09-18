@@ -40,7 +40,7 @@ export function formatNewerExactPinnedNpmDefaultLineMessage(params: {
   );
 }
 
-function formatNewerExactPinnedClawHubDefaultLineMessage(params: {
+export function formatNewerExactPinnedClawHubDefaultLineMessage(params: {
   pluginId: string;
   recordedSpec: string;
   currentVersion: string;

@@ -312,6 +312,7 @@ describe("resolveUpdatedInstallCommandEnv", () => {
     expect(env.OPENCLAW_STATE_DIR).toBe(path.join("/srv/openclaw", "daemon-state"));
     expect(env.PATH).toBe("/daemon/bin");
     expect(env.NODE_DISABLE_COMPILE_CACHE).toBe("1");
+    expect(env.npm_config_umask).toBe("0022");
     expect(resolveUpdatedInstallCommandEnv({ processEnv: env })).toEqual(env);
   });
 

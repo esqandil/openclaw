@@ -333,4 +333,44 @@ describe("plugin release cohort package reconciliation", () => {
     expect(result.config.plugins?.installs).toEqual(canonicalRecords);
     expect(result.config.plugins?.load?.paths).toEqual(["/plugins/unrelated.js"]);
   });
+
+  it("leaves changed=false and npmChanged=false when every official ClawHub cohort member is unchanged", async () => {
+    const config = {
+      plugins: {
+        installs: {
+          demo: {
+            source: "clawhub" as const,
+            spec: "clawhub:demo@1.2.3",
+            clawhubPackage: "demo",
+            installPath: "/tmp/demo",
+          },
+        },
+      },
+    };
+    const unchangedConfig = { ...config };
+    updateNpmInstalledPluginsMock.mockResolvedValue({
+      config: unchangedConfig,
+      changed: false,
+      outcomes: [
+        {
+          pluginId: "demo",
+          status: "unchanged",
+          currentVersion: "1.2.3",
+          nextVersion: "1.2.3",
+          message: "demo is up to date (1.2.3).",
+        },
+      ],
+    });
+    collectMissingPluginInstallPayloadsMock.mockResolvedValue([]);
+
+    const result = await convergePluginReleaseCohort({
+      config,
+      channel: "stable",
+      timeoutMs: 60_000,
+    });
+
+    expect(result.changed).toBe(false);
+    expect(result.npmChanged).toBe(false);
+    expect(updateNpmInstalledPluginsMock).toHaveBeenCalled();
+  });
 });

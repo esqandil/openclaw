@@ -123,6 +123,12 @@ export function resolveUpdatedInstallCommandEnv(params?: {
   return disableUpdatedPackageCompileCacheEnv({
     ...processEnv,
     ...serviceEnv,
+    // npm otherwise creates installed package files through the caller's
+    // process umask. A group-writable service/update shell (for example 0002)
+    // makes bundled secret resolvers fail their executable trust checks after
+    // every managed package update. npm combines this floor with the process
+    // umask, so stricter operator masks remain stricter.
+    npm_config_umask: "0022",
   });
 }
 

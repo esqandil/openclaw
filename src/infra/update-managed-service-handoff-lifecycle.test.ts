@@ -34,13 +34,15 @@ import {
 import { registerManagedUpdateHandoffTriageTests } from "./update-managed-service-handoff-triage.test-support.js";
 import { signalMockManagedUpdateHandoffReady } from "./update-managed-service-handoff.test-support.js";
 
-const { forceKillChildProcessTreeMock, resolvePreferredOpenClawTmpDirMock, spawnMock } = vi.hoisted(
-  () => ({
+const { forceKillChildProcessTreeMock, resolvePreferredOpenClawTmpDirMock, spawnMock, rmDenials } =
+  vi.hoisted(() => ({
     forceKillChildProcessTreeMock: vi.fn(),
     resolvePreferredOpenClawTmpDirMock: vi.fn(),
     spawnMock: vi.fn(),
-  }),
-);
+    // Exact paths whose next direct fs.rm rejects, standing in for a scratch
+    // input the parent cannot unlink.
+    rmDenials: new Set<string>(),
+  }));
 const MOCK_INSTALL_ROOT = path.join(os.tmpdir(), `openclaw-handoff-lifecycle-${process.pid}`);
 
 function createSpawnMock(params?: { pid?: number }) {
@@ -56,6 +58,17 @@ function createSpawnMock(params?: { pid?: number }) {
 }
 
 const mockedHandoffLeaseCleanups = new Set<() => void>();
+
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  const rm: typeof actual.rm = (target, options) => {
+    if (typeof target === "string" && rmDenials.delete(target)) {
+      return Promise.reject(Object.assign(new Error(`EACCES: ${target}`), { code: "EACCES" }));
+    }
+    return actual.rm(target, options);
+  };
+  return { ...actual, rm, default: { ...actual, rm } };
+});
 
 vi.mock("node:child_process", async () => {
   const { mockNodeChildProcessModule } =
@@ -118,6 +131,7 @@ beforeEach(async () => {
 
 afterEach(async () => {
   vi.useRealTimers();
+  rmDenials.clear();
   await Promise.all([...managedProcessCleanups].map((cleanup) => cleanup()));
   managedProcessCleanups.clear();
   for (const cleanup of mockedHandoffLeaseCleanups) {
@@ -633,6 +647,261 @@ describe("managed service update handoff", () => {
     expect(child.listenerCount("error")).toBe(0);
     expect(child.stdout.destroyed).toBe(true);
   });
+
+  itUnix.each(["stderr", "log"] as const)(
+    "names the helper %s cause and retains only a redacted log tail when the launcher exits before readiness",
+    async (channel) => {
+      const secret = "sk-test-handoff-startup-secret-1234567890";
+      const cause = `managed handoff lease directory is unsafe token=${secret}`;
+      // Enough earlier output that the retained tail must be cut at a line boundary.
+      const fillerLine = "x".repeat(80);
+      const output = `${`${fillerLine}\n`.repeat(100)}${
+        channel === "stderr" ? "Error: " : "[now] handoff setup failed: Error: "
+      }${cause}\n`;
+      const { spawn: actualSpawn } =
+        await vi.importActual<typeof import("node:child_process")>("node:child_process");
+      spawnMock.mockImplementationOnce(
+        (_command: string, args: string[], options: import("node:child_process").SpawnOptions) => {
+          // Stand in for a helper that dies at startup: an uncaught top-level error
+          // reaches stderr, while the async setup path only appends to the helper log.
+          const logPath = path.join(path.dirname(args.at(-1) ?? ""), "handoff.log");
+          const script =
+            channel === "stderr"
+              ? `process.stderr.write(${JSON.stringify(output)}); process.exit(1);`
+              : `require("node:fs").appendFileSync(${JSON.stringify(logPath)}, ${JSON.stringify(output)}); process.exit(1);`;
+          return actualSpawn(process.execPath, ["-e", script], options);
+        },
+      );
+      const { startManagedServiceUpdateHandoff } =
+        await import("./update-managed-service-handoff.js");
+      const error = await startManagedServiceUpdateHandoff({
+        root: MOCK_INSTALL_ROOT,
+        restartDrainTimeoutMs: 300_000,
+        parentPid: process.pid,
+        execPath: "/usr/local/bin/node",
+        argv1: "/opt/openclaw/openclaw.mjs",
+        meta: {},
+      }).then(
+        () => undefined,
+        (err: unknown) => err,
+      );
+      const [, args] = spawnMock.mock.calls[0] as unknown as [string, string[]];
+      const handoffDir = path.dirname(args.at(-1) ?? "");
+      tempDirs.add(handoffDir);
+
+      expect(error).toBeInstanceOf(Error);
+      const message = (error as Error).message;
+      expect(message).toMatch(
+        /^managed update handoff exited before signaling readiness \(code=1, signal=null\); redacted helper log tail retained at .*handoff\.log\n/u,
+      );
+      expect(message).toContain("managed handoff lease directory is unsafe");
+      expect(message).not.toContain(secret);
+      expect(message.slice(message.indexOf("\n") + 1).length).toBeLessThanOrEqual(1025);
+      await expect(fs.readdir(handoffDir)).resolves.toEqual(["handoff.log"]);
+      const logPath = path.join(handoffDir, "handoff.log");
+      expect((await fs.stat(logPath)).mode & 0o777).toBe(0o600);
+      const log = await fs.readFile(logPath, "utf8");
+      expect(log).toContain("managed handoff lease directory is unsafe");
+      expect(log).not.toContain(secret);
+      expect(Buffer.byteLength(log)).toBeLessThanOrEqual(4096);
+      expect(log.split("\n")[0]).toBe(fillerLine);
+      expect(forceKillChildProcessTreeMock).not.toHaveBeenCalled();
+    },
+  );
+
+  itUnix(
+    "retains nothing when the helper log tail has no line boundary before readiness failure",
+    async () => {
+      const secret = "sk-test-handoff-startup-secret-1234567890";
+      // One newline-free line longer than the 4096-byte tail read, positioned so the
+      // byte cut lands inside the secret: its suffix is not a recognizable token.
+      const trailing = "z".repeat(4096 - 20);
+      const output = `${"y".repeat(200)}token=${secret}${trailing}`;
+      const { spawn: actualSpawn } =
+        await vi.importActual<typeof import("node:child_process")>("node:child_process");
+      spawnMock.mockImplementationOnce(
+        (_command: string, _args: string[], options: import("node:child_process").SpawnOptions) =>
+          actualSpawn(
+            process.execPath,
+            ["-e", `process.stderr.write(${JSON.stringify(output)}); process.exit(1);`],
+            options,
+          ),
+      );
+      const { startManagedServiceUpdateHandoff } =
+        await import("./update-managed-service-handoff.js");
+      const error = await startManagedServiceUpdateHandoff({
+        root: MOCK_INSTALL_ROOT,
+        restartDrainTimeoutMs: 300_000,
+        parentPid: process.pid,
+        execPath: "/usr/local/bin/node",
+        argv1: "/opt/openclaw/openclaw.mjs",
+        meta: {},
+      }).then(
+        () => undefined,
+        (err: unknown) => err,
+      );
+      const [, args] = spawnMock.mock.calls[0] as unknown as [string, string[]];
+      const handoffDir = path.dirname(args.at(-1) ?? "");
+      tempDirs.add(handoffDir);
+
+      await expect(pathExists(handoffDir)).resolves.toBe(false);
+      expect(error).toBeInstanceOf(Error);
+      expect((error as Error).message).toBe(
+        "managed update handoff exited before signaling readiness (code=1, signal=null)",
+      );
+      expect(forceKillChildProcessTreeMock).not.toHaveBeenCalled();
+    },
+  );
+
+  itUnix(
+    "keeps the retained log within 4096 bytes when the startup capture exactly fills the tail read",
+    async () => {
+      // The whole capture is read, but its final newline would push the file to 4097 bytes.
+      const fillerLine = "x".repeat(79);
+      const finalLine = "helper died 1234";
+      const output = `${`${fillerLine}\n`.repeat(51)}${finalLine}`;
+      expect(Buffer.byteLength(output)).toBe(4096);
+      const { spawn: actualSpawn } =
+        await vi.importActual<typeof import("node:child_process")>("node:child_process");
+      spawnMock.mockImplementationOnce(
+        (_command: string, _args: string[], options: import("node:child_process").SpawnOptions) =>
+          actualSpawn(
+            process.execPath,
+            ["-e", `process.stderr.write(${JSON.stringify(output)}); process.exit(1);`],
+            options,
+          ),
+      );
+      const { startManagedServiceUpdateHandoff } =
+        await import("./update-managed-service-handoff.js");
+      const error = await startManagedServiceUpdateHandoff({
+        root: MOCK_INSTALL_ROOT,
+        restartDrainTimeoutMs: 300_000,
+        parentPid: process.pid,
+        execPath: "/usr/local/bin/node",
+        argv1: "/opt/openclaw/openclaw.mjs",
+        meta: {},
+      }).then(
+        () => undefined,
+        (err: unknown) => err,
+      );
+      const [, args] = spawnMock.mock.calls[0] as unknown as [string, string[]];
+      const handoffDir = path.dirname(args.at(-1) ?? "");
+      tempDirs.add(handoffDir);
+
+      expect(error).toBeInstanceOf(Error);
+      expect((error as Error).message).toMatch(
+        /redacted helper log tail retained at .*handoff\.log\n/u,
+      );
+      const log = await fs.readFile(path.join(handoffDir, "handoff.log"), "utf8");
+      expect(Buffer.byteLength(log)).toBeLessThanOrEqual(4096);
+      expect(log.endsWith("\n")).toBe(true);
+      expect(log.split("\n")).toEqual([...Array<string>(50).fill(fillerLine), finalLine, ""]);
+    },
+  );
+
+  itUnix(
+    "retains and advertises nothing when a sensitive scratch input cannot be removed",
+    async () => {
+      const secret = "sk-test-handoff-startup-secret-1234567890";
+      const output = `Error: managed handoff lease directory is unsafe token=${secret}\n`;
+      const { spawn: actualSpawn } =
+        await vi.importActual<typeof import("node:child_process")>("node:child_process");
+      spawnMock.mockImplementationOnce(
+        (_command: string, args: string[], options: import("node:child_process").SpawnOptions) => {
+          rmDenials.add(args.at(-1) ?? "");
+          return actualSpawn(
+            process.execPath,
+            ["-e", `process.stderr.write(${JSON.stringify(output)}); process.exit(1);`],
+            options,
+          );
+        },
+      );
+      const { startManagedServiceUpdateHandoff } =
+        await import("./update-managed-service-handoff.js");
+      const error = await startManagedServiceUpdateHandoff({
+        root: MOCK_INSTALL_ROOT,
+        restartDrainTimeoutMs: 300_000,
+        parentPid: process.pid,
+        execPath: "/usr/local/bin/node",
+        argv1: "/opt/openclaw/openclaw.mjs",
+        meta: {},
+      }).then(
+        () => undefined,
+        (err: unknown) => err,
+      );
+      const [, args] = spawnMock.mock.calls[0] as unknown as [string, string[]];
+      const handoffDir = path.dirname(args.at(-1) ?? "");
+      tempDirs.add(handoffDir);
+
+      expect(rmDenials.size).toBe(0);
+      expect(error).toBeInstanceOf(Error);
+      expect((error as Error).message).toBe(
+        "managed update handoff exited before signaling readiness (code=1, signal=null)",
+      );
+      await expect(pathExists(handoffDir)).resolves.toBe(false);
+    },
+  );
+
+  it.each([
+    [
+      "an Error carrying a raw cause and custom properties",
+      { pid: process.pid },
+      (secret: string) =>
+        Object.assign(new Error(`spawn ENOENT token=${secret}`), {
+          code: "ENOENT",
+          cause: { token: secret },
+          spawnargs: [secret],
+        }),
+      { message: /^spawn ENOENT /u, code: "ENOENT" },
+    ],
+    [
+      "a non-Error value",
+      // A handle without a pid waits for "spawn", so the raw value reaches the boundary.
+      { pid: 0 },
+      (secret: string) => ({ code: "EACCES", token: secret }),
+      { message: /^managed update handoff failed before signaling readiness$/u, code: "EACCES" },
+    ],
+  ] as const)(
+    "rebuilds %s into a safe startup failure",
+    async (_label, handle, thrown, expected) => {
+      const secret = "sk-test-handoff-startup-secret-1234567890";
+      const raw = thrown(secret);
+      const child = createSpawnMock(handle);
+      spawnMock.mockImplementationOnce(() => {
+        process.nextTick(() => child.emit("error", raw));
+        return child;
+      });
+      const { startManagedServiceUpdateHandoff } =
+        await import("./update-managed-service-handoff.js");
+      const error = await startManagedServiceUpdateHandoff({
+        root: MOCK_INSTALL_ROOT,
+        restartDrainTimeoutMs: 300_000,
+        parentPid: process.pid,
+        execPath: "/usr/local/bin/node",
+        argv1: "/opt/openclaw/openclaw.mjs",
+        meta: {},
+      }).then(
+        () => undefined,
+        (err: unknown) => err,
+      );
+      const [, args] = spawnMock.mock.calls[0] as unknown as [string, string[]];
+      const handoffDir = path.dirname(args.at(-1) ?? "");
+      tempDirs.add(handoffDir);
+
+      expect(error).toBeInstanceOf(Error);
+      expect(error).not.toBe(raw);
+      const failure = error as Error & { code?: unknown };
+      expect(failure.message).toMatch(expected.message);
+      expect(failure.code).toBe(expected.code);
+      expect(failure).not.toHaveProperty("cause");
+      expect(failure).not.toHaveProperty("token");
+      expect(failure).not.toHaveProperty("spawnargs");
+      for (const key of Object.getOwnPropertyNames(failure)) {
+        expect(String(Reflect.get(failure, key))).not.toContain(secret);
+      }
+      await expect(pathExists(handoffDir)).resolves.toBe(false);
+    },
+  );
 
   it("strips supervisor hints while preserving service identity for the CLI handoff", async () => {
     const { startManagedServiceUpdateHandoff } =

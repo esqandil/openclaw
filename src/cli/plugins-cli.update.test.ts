@@ -1965,5 +1965,47 @@ describe("plugins cli update", () => {
       'Failed to update hook pack "demo-hooks": registry timeout',
     );
   });
+
+  it("--all --dry-run unchanged ClawHub has no Downloading/Extracting and no installer/download side effect", async () => {
+    const config = {
+      plugins: {
+        installs: {
+          demo: {
+            source: "clawhub",
+            spec: "clawhub:@openclaw/demo@1.2.3",
+            clawhubPackage: "@openclaw/demo",
+            installPath: "/tmp/demo",
+          },
+        },
+      },
+    } as OpenClawConfig;
+    pluginCliConfigMock.mockReturnValue(config);
+    setInstalledPluginIndexInstallRecords(config.plugins?.installs ?? {});
+    primePluginUpdate(
+      config,
+      [
+        {
+          pluginId: "demo",
+          status: "unchanged",
+          currentVersion: "1.2.3",
+          nextVersion: "1.2.3",
+          message: "demo is up to date (1.2.3).",
+        },
+      ],
+      false,
+    );
+    updateNpmInstalledHookPacksMock.mockResolvedValue({ config, changed: false, outcomes: [] });
+
+    await runPluginsCommand(["plugins", "update", "--all", "--dry-run"]);
+
+    expect(pluginsCliRuntimeLogs).not.toContain(expect.stringContaining("Downloading"));
+    expect(pluginsCliRuntimeLogs).not.toContain(expect.stringContaining("Extracting"));
+    expect(updateNpmInstalledPluginsMock).toHaveBeenCalledWith(
+      expect.objectContaining({ dryRun: true }),
+    );
+    // no side effect writes or lease for dry unchanged
+    expect(configWriteMock).not.toHaveBeenCalled();
+    expect(writePersistedInstalledPluginIndexInstallRecordsWithLeaseMock).not.toHaveBeenCalled();
+  });
 });
 /* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

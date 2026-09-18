@@ -3,11 +3,22 @@ import { resolveUserPath } from "../infra/home-dir.js";
 import { isPathInside } from "../infra/path-safety.js";
 import { inspectPathPermissions, safeStat } from "../infra/permissions.js";
 
-/** Checks the same command-path trust boundary before validation, writes, and execution. */
+/** Checks the same command-path trust boundary before validation, writes, and execution.
+ * The `fromTrustedPluginIntegration` marker (set exclusively during materialization
+ * of trusted bundled/global plugin "${node}" integrations) relaxes the POSIX
+ * owner check to also accept uid=0 (root-owned system Node, e.g. /usr/bin/node).
+ * Manual exec providers must never carry or trigger this relaxation.
+ */
 export async function assertSecureExecCommandPath(params: {
   command: string;
   label: string;
   trustedDirs?: string[];
+  /**
+   * Provenance marker. Only true when the command path was materialized from an
+   * active trusted (bundled/global) pluginIntegration secret provider using ${node}.
+   * Cannot be supplied by persisted manual config (rejected in CLI validation).
+   */
+  fromTrustedPluginIntegration?: boolean;
 }): Promise<string> {
   const commandPath = resolveUserPath(params.command);
   // resolveUserPath expands and absolutizes nonempty input; the schema rejects relative commands.
@@ -54,9 +65,12 @@ export async function assertSecureExecCommandPath(params: {
   if (process.platform !== "win32" && typeof process.getuid === "function" && stat.uid != null) {
     const uid = process.getuid();
     if (stat.uid !== uid) {
-      throw new Error(
-        `${params.label} must be owned by the current user (uid=${uid}): ${commandPath}`,
-      );
+      const allowRootForTrusted = params.fromTrustedPluginIntegration === true && stat.uid === 0;
+      if (!allowRootForTrusted) {
+        throw new Error(
+          `${params.label} must be owned by the current user (uid=${uid}): ${commandPath}`,
+        );
+      }
     }
   }
   return commandPath;

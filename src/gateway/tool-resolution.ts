@@ -14,6 +14,7 @@ import { createOpenClawTools } from "../agents/openclaw-tools.js";
 import { filterRequesterYieldTools } from "../agents/openclaw-tools.requester-yield.js";
 import { resolveRequesterToolPolicies } from "../agents/requester-tool-policy.js";
 import type { PreparedRootedExecutionCapability } from "../agents/rooted-run-params.js";
+import { loadAgentRuntimePluginRegistryHandle } from "../agents/runtime-plugins.js";
 import { resolveSandboxRuntimeStatus } from "../agents/sandbox/runtime-status.js";
 import { resolveScheduledToolCallerContext } from "../agents/scheduled-tool-policy.js";
 import { buildDeclaredToolAllowlistContext } from "../agents/tool-policy-declared-context.js";
@@ -42,6 +43,7 @@ import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { resolveEventSessionRoutingPolicy } from "../infra/event-session-routing.js";
 import { resolveExactExecModeFromPolicy } from "../infra/exec-approvals.js";
 import { logWarn } from "../logger.js";
+import { withPluginRuntimeRegistryScope } from "../plugins/runtime/gateway-request-scope.js";
 import { getPluginToolMeta } from "../plugins/tool-metadata.js";
 import {
   DEFAULT_GATEWAY_HTTP_TOOL_DENY,
@@ -229,6 +231,20 @@ export function resolveGatewayScopedTools(
   const workspaceDir =
     params.rootedExecution?.workspaceDir ??
     (params.workspaceDir?.trim() || resolveAgentWorkspaceDir(params.cfg, sessionAgentId));
+  // Adopt runtime registrations (memory corpus supplements for wiki/episodic etc)
+  // into a workspace-scoped registry for gateway/MCP tool construction.
+  // This ensures MCP loopback (which resolves via createOpenClawTools +
+  // resolvePluginTools using current scope's request registry) receives
+  // supplements from the root donor under the same gates as agent runtimes.
+  // The per-workspace load + adopt produces a registry whose .tools will
+  // match the requested onlyPluginIds, so hasScoped will select it and the
+  // closed-over registry in tool callbacks will carry the supplements.
+  const adoptedPluginRegistryForGateway = loadAgentRuntimePluginRegistryHandle({
+    config: params.cfg,
+    workspaceDir,
+    allowGatewaySubagentBinding: params.allowGatewaySubagentBinding,
+  });
+
   const explicitDenylist = collectExplicitDenylist([
     profilePolicy,
     providerProfilePolicy,
@@ -265,93 +281,95 @@ export function resolveGatewayScopedTools(
     gatewayRequestedTools.length > 0 ? { allow: gatewayRequestedTools } : undefined,
   ].some(hasRestrictiveAllowPolicy);
 
-  const openClawTools = createOpenClawTools({
-    agentSessionKey: params.sessionKey,
-    runId: params.runId,
-    execSession: params.execSession,
-    execOverrides: params.execOverrides,
-    approvalReviewerDeviceIds: params.approvalReviewerDeviceId
-      ? [params.approvalReviewerDeviceId]
-      : undefined,
-    requesterAgentIdOverride: sessionAgentId,
-    agentChannel: params.messageProvider ?? undefined,
-    agentAccountId: params.accountId,
-    questionPrompt: createChannelQuestionPromptDelivery({
-      cfg: params.cfg,
-      channel: params.messageProvider,
-      to: params.currentChannelId ?? params.agentTo,
-      accountId: params.accountId,
-      threadId: params.currentThreadTs ?? params.agentThreadId,
+  const openClawTools = withPluginRuntimeRegistryScope(adoptedPluginRegistryForGateway, () =>
+    createOpenClawTools({
+      agentSessionKey: params.sessionKey,
+      runId: params.runId,
+      execSession: params.execSession,
+      execOverrides: params.execOverrides,
+      approvalReviewerDeviceIds: params.approvalReviewerDeviceId
+        ? [params.approvalReviewerDeviceId]
+        : undefined,
+      requesterAgentIdOverride: sessionAgentId,
+      agentChannel: params.messageProvider ?? undefined,
+      agentAccountId: params.accountId,
+      questionPrompt: createChannelQuestionPromptDelivery({
+        cfg: params.cfg,
+        channel: params.messageProvider,
+        to: params.currentChannelId ?? params.agentTo,
+        accountId: params.accountId,
+        threadId: params.currentThreadTs ?? params.agentThreadId,
+      }),
+      gatewayCallerAccountId: gatewayCaller.accountId,
+      gatewayCallerChannel: gatewayCaller.channel,
+      gatewayCallerLocal: gatewayCaller.local,
+      inboundEventKind: params.inboundEventKind,
+      sourceReplyDeliveryMode,
+      sourceReplyOnly: params.sourceReplyOnly,
+      taskSuggestionDeliveryMode: params.taskSuggestionDeliveryMode,
+      agentTo: params.agentTo,
+      agentThreadId: params.agentThreadId,
+      currentChannelId: params.currentChannelId ?? params.agentTo,
+      currentThreadTs: params.currentThreadTs ?? params.agentThreadId,
+      currentMessageId: params.currentMessageId,
+      replyToMode: params.replyToMode,
+      currentInboundAudio: params.currentInboundAudio,
+      sessionId: params.sessionId,
+      onYield: params.onYield,
+      requireExplicitMessageTarget: params.requireExplicitMessageTarget,
+      senderIsOwner: params.senderIsOwner,
+      conversationReadOrigin: params.conversationReadOrigin,
+      allowGatewaySubagentBinding: params.allowGatewaySubagentBinding,
+      skillWorkshop: params.skillWorkshop,
+      allowMediaInvokeCommands: params.allowMediaInvokeCommands,
+      disablePluginTools: params.disablePluginTools,
+      wrapBeforeToolCallHook: false,
+      config: params.cfg,
+      sessionConfigSource: "runtime",
+      agentDir: params.agentDir,
+      authProfileStore: params.authProfileStore,
+      modelProvider: params.modelProvider,
+      modelId: params.modelId,
+      modelHasVision: params.modelHasVision,
+      pairedNodeComputerUse: params.pairedNodeComputerUse,
+      clientCaps: params.clientCaps,
+      pinnedWidgetAuthoring: surface === "loopback" ? params.pinnedWidgetAuthoring : undefined,
+      workspaceDir,
+      sandboxed,
+      ...(params.rootedExecution
+        ? {
+            cwd: params.rootedExecution.cwd,
+            fsPolicy: { workspaceOnly: true, root: params.rootedExecution.root },
+            sessionPermissionPolicy: params.rootedExecution.sessionPermissionPolicy,
+            sandboxRoot: params.rootedExecution.sandbox?.workspaceDir,
+            sandboxContainerWorkdir: params.rootedExecution.sandbox?.containerWorkdir,
+            sandboxFsBridge: params.rootedExecution.sandbox?.fsBridge,
+            sandboxBrowserBridgeUrl: params.rootedExecution.sandbox?.browser?.bridgeUrl,
+            allowHostBrowserControl: params.rootedExecution.sandbox
+              ? params.rootedExecution.sandbox.browserAllowHostControl
+              : true,
+          }
+        : {}),
+      pluginToolAllowlist: collectExplicitAllowlist([
+        profilePolicy,
+        providerProfilePolicy,
+        globalPolicy,
+        globalProviderPolicy,
+        agentPolicy,
+        agentProviderPolicy,
+        groupPolicy,
+        senderPolicy,
+        sandboxPolicy,
+        subagentPolicy,
+        inheritedToolPolicy,
+        gatewayRequestedTools.length > 0 ? { allow: gatewayRequestedTools } : undefined,
+      ]),
+      pluginToolDenylist: explicitDenylist,
+      cronCreatorToolAllowlist,
+      inheritedToolAllowlist,
+      inheritedToolDenylist,
     }),
-    gatewayCallerAccountId: gatewayCaller.accountId,
-    gatewayCallerChannel: gatewayCaller.channel,
-    gatewayCallerLocal: gatewayCaller.local,
-    inboundEventKind: params.inboundEventKind,
-    sourceReplyDeliveryMode,
-    sourceReplyOnly: params.sourceReplyOnly,
-    taskSuggestionDeliveryMode: params.taskSuggestionDeliveryMode,
-    agentTo: params.agentTo,
-    agentThreadId: params.agentThreadId,
-    currentChannelId: params.currentChannelId ?? params.agentTo,
-    currentThreadTs: params.currentThreadTs ?? params.agentThreadId,
-    currentMessageId: params.currentMessageId,
-    replyToMode: params.replyToMode,
-    currentInboundAudio: params.currentInboundAudio,
-    sessionId: params.sessionId,
-    onYield: params.onYield,
-    requireExplicitMessageTarget: params.requireExplicitMessageTarget,
-    senderIsOwner: params.senderIsOwner,
-    conversationReadOrigin: params.conversationReadOrigin,
-    allowGatewaySubagentBinding: params.allowGatewaySubagentBinding,
-    skillWorkshop: params.skillWorkshop,
-    allowMediaInvokeCommands: params.allowMediaInvokeCommands,
-    disablePluginTools: params.disablePluginTools,
-    wrapBeforeToolCallHook: false,
-    config: params.cfg,
-    sessionConfigSource: "runtime",
-    agentDir: params.agentDir,
-    authProfileStore: params.authProfileStore,
-    modelProvider: params.modelProvider,
-    modelId: params.modelId,
-    modelHasVision: params.modelHasVision,
-    pairedNodeComputerUse: params.pairedNodeComputerUse,
-    clientCaps: params.clientCaps,
-    pinnedWidgetAuthoring: surface === "loopback" ? params.pinnedWidgetAuthoring : undefined,
-    workspaceDir,
-    sandboxed,
-    ...(params.rootedExecution
-      ? {
-          cwd: params.rootedExecution.cwd,
-          fsPolicy: { workspaceOnly: true, root: params.rootedExecution.root },
-          sessionPermissionPolicy: params.rootedExecution.sessionPermissionPolicy,
-          sandboxRoot: params.rootedExecution.sandbox?.workspaceDir,
-          sandboxContainerWorkdir: params.rootedExecution.sandbox?.containerWorkdir,
-          sandboxFsBridge: params.rootedExecution.sandbox?.fsBridge,
-          sandboxBrowserBridgeUrl: params.rootedExecution.sandbox?.browser?.bridgeUrl,
-          allowHostBrowserControl: params.rootedExecution.sandbox
-            ? params.rootedExecution.sandbox.browserAllowHostControl
-            : true,
-        }
-      : {}),
-    pluginToolAllowlist: collectExplicitAllowlist([
-      profilePolicy,
-      providerProfilePolicy,
-      globalPolicy,
-      globalProviderPolicy,
-      agentPolicy,
-      agentProviderPolicy,
-      groupPolicy,
-      senderPolicy,
-      sandboxPolicy,
-      subagentPolicy,
-      inheritedToolPolicy,
-      gatewayRequestedTools.length > 0 ? { allow: gatewayRequestedTools } : undefined,
-    ]),
-    pluginToolDenylist: explicitDenylist,
-    cronCreatorToolAllowlist,
-    inheritedToolAllowlist,
-    inheritedToolDenylist,
-  });
+  );
   const execDefaults =
     nodeExecSurface || mediatedToolNames.size > 0
       ? resolveExecDefaults({

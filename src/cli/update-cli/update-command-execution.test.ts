@@ -352,6 +352,42 @@ describe("mutable update execution", () => {
     expect(mocks.runPackageUpdate).toHaveBeenCalledOnce();
   });
 
+  it.each([
+    {
+      name: "defers Doctor for a live managed Gateway with --no-restart",
+      shouldRestart: false,
+      running: true,
+      expected: "defer-live-managed-gateway",
+    },
+    {
+      name: "runs Doctor for a restarting update",
+      shouldRestart: true,
+      running: true,
+      expected: "run",
+    },
+    {
+      name: "runs Doctor for --no-restart when no managed Gateway is running",
+      shouldRestart: false,
+      running: false,
+      expected: "run",
+    },
+  ] as const)("$name", async ({ shouldRestart, running, expected }) => {
+    mocks.maybeStopService.mockImplementation(async ({ phase }) => ({
+      ...inspectOrStopService(phase),
+      running,
+      stopped: shouldRestart && running && phase === "prepare",
+    }));
+
+    await executeMutableUpdate({
+      ...executionParams("package"),
+      shouldRestart,
+    });
+
+    expect(mocks.runPackageUpdate).toHaveBeenCalledWith(
+      expect.objectContaining({ postInstallDoctorPolicy: expected }),
+    );
+  });
+
   it("refuses configuration drift during plugin admission before mutable preparation", async () => {
     let configChanged = false;
     mocks.pluginPreflight.mockImplementation(async () => {

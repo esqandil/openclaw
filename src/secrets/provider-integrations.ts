@@ -240,6 +240,7 @@ function materializeExecProviderConfig(
     ...(integration.env ? { env: integration.env } : {}),
     ...(integration.passEnv ? { passEnv: integration.passEnv } : {}),
     trustedDirs,
+    _fromTrustedPluginIntegration: true,
   };
 }
 

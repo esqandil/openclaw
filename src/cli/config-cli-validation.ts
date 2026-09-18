@@ -338,11 +338,21 @@ async function collectConfigSecretProviderErrors(params: {
         issues.push({ path: providerPath, message: resolved.reason });
       }
     } else if (isPlainRecord(provider) && "command" in provider) {
+      // eslint-disable-next-line no-underscore-dangle, typescript/no-explicit-any
+      if ((provider as any)._fromTrustedPluginIntegration === true) {
+        issues.push({
+          path: providerPath,
+          message:
+            "manual exec secret providers must not set the internal _fromTrustedPluginIntegration marker (only materialized from trusted plugin integrations)",
+        });
+        continue;
+      }
       try {
         await assertSecureExecCommandPath({
           command: provider.command,
           label: `${providerPath}.command`,
           trustedDirs: provider.trustedDirs,
+          fromTrustedPluginIntegration: false,
         });
       } catch (err) {
         issues.push({ path: `${providerPath}.command`, message: formatErrorMessage(err) });

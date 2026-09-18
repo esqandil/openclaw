@@ -3694,6 +3694,7 @@ describe("resolvePluginTools optional tools", () => {
       });
     });
     const loadedRegistry = {
+      ...createEmptyPluginRegistry(),
       plugins: [createToolRuntimeRecord("memory-core")],
       tools: [
         {
@@ -3709,6 +3710,7 @@ describe("resolvePluginTools optional tools", () => {
     };
     setActivePluginRegistry(
       {
+        ...createEmptyPluginRegistry(),
         plugins: [createToolRuntimeRecord("memory-core")],
         tools: [],
         diagnostics: [],

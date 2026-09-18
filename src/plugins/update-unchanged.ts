@@ -1,9 +1,14 @@
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import type { NpmSpecResolution } from "../infra/install-source-utils.js";
 import type { UpdateChannel } from "../infra/update-channels.js";
+import type { ClawHubReleaseMetadata } from "./clawhub.js";
 import { buildNpmResolutionInstallFields } from "./installs.js";
-import { formatNewerExactPinnedNpmDefaultLineMessage } from "./update-attempt.js";
 import {
+  formatNewerExactPinnedNpmDefaultLineMessage,
+  formatNewerExactPinnedClawHubDefaultLineMessage,
+} from "./update-attempt.js";
+import {
+  resolveNewerExactPinnedClawHubDefaultLine,
   resolveNewerExactPinnedNpmDefaultLine,
   type PluginUpdateOutcome,
   type UpdatablePluginInstallRecord,
@@ -71,6 +76,50 @@ export async function reconcileUnchangedUpdate(params: {
       message:
         newerExactPinnedDefaultLine && params.record.spec
           ? formatNewerExactPinnedNpmDefaultLineMessage({
+              pluginId: params.pluginId,
+              recordedSpec: params.record.spec,
+              currentVersion: params.currentVersion,
+              newer: newerExactPinnedDefaultLine,
+            })
+          : `${params.pluginId} is up to date (${params.currentVersion}).`,
+    },
+  };
+}
+
+export async function reconcileUnchangedClawHubUpdate(params: {
+  config: OpenClawConfig;
+  pluginId: string;
+  record: UpdatablePluginInstallRecord;
+  currentVersion: string;
+  metadata: ClawHubReleaseMetadata;
+  updateChannel?: UpdateChannel;
+  timeoutMs?: number;
+  hasSpecOverride: boolean;
+}): Promise<{ config: OpenClawConfig; changed: boolean; outcome: PluginUpdateOutcome }> {
+  // IMPORTANT: no record or config mutation on the unchanged ClawHub path (no resolvedAt/installedAt churn).
+  const newerExactPinnedDefaultLine = !params.hasSpecOverride
+    ? await resolveNewerExactPinnedClawHubDefaultLine({
+        currentVersion: params.currentVersion,
+        recordedSpec: params.record.spec,
+        probeClawHubVersion: params.metadata.version,
+        baseUrl: params.metadata.baseUrl,
+        updateChannel: params.updateChannel,
+        timeoutMs: params.timeoutMs,
+        detail: params.metadata.detail,
+      })
+    : undefined;
+
+  return {
+    config: params.config,
+    changed: false,
+    outcome: {
+      pluginId: params.pluginId,
+      status: "unchanged",
+      currentVersion: params.currentVersion,
+      nextVersion: newerExactPinnedDefaultLine?.version ?? params.metadata.version,
+      message:
+        newerExactPinnedDefaultLine && params.record.spec
+          ? formatNewerExactPinnedClawHubDefaultLineMessage({
               pluginId: params.pluginId,
               recordedSpec: params.record.spec,
               currentVersion: params.currentVersion,

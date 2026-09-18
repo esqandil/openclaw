@@ -933,7 +933,7 @@ async function verifyClawHubArchiveFiles(params: {
   }
 }
 
-async function resolveCompatiblePackageVersion(params: {
+export async function resolveCompatiblePackageVersion(params: {
   detail: ClawHubPackageDetail;
   requestedVersion?: string;
   baseUrl?: string;
@@ -1208,6 +1208,139 @@ function logClawHubPackageSummary(params: {
       .join("\n"),
   );
 }
+
+/**
+ * Metadata-only ClawHub resolver for unchanged-install short-circuit.
+ * Performs parse, fetch detail, version resolution, package validation and runtime id
+ * but performs NO download, NO extract, NO install, NO trust check, and NO "Resolving" log.
+ * Used by update-installed gate to decide whether a recorded ClawHub install matches
+ * the registry-declared artifact identity for the target version.
+ */
+export async function resolveClawHubReleaseMetadata(params: {
+  spec: string;
+  baseUrl?: string;
+  token?: string;
+  timeoutMs?: number;
+  env?: RuntimeVersionEnv;
+}): Promise<
+  | {
+      ok: true;
+      packageName: string;
+      version: string;
+      baseUrl: string;
+      clawpackSha256: string | null;
+      archiveIntegrity: string | null;
+      npmIntegrity: string | null;
+      npmShasum: string | null;
+      officialClawHubPackage: boolean;
+      detail: ClawHubPackageDetail;
+    }
+  | ClawHubInstallFailure
+> {
+  const parsed = parseClawHubPluginSpec(params.spec);
+  if (!parsed?.name) {
+    return buildClawHubInstallFailure(
+      `invalid ClawHub plugin spec: ${params.spec}`,
+      CLAWHUB_INSTALL_ERROR_CODE.INVALID_SPEC,
+    );
+  }
+
+  let detail: ClawHubPackageDetail;
+  try {
+    detail = await fetchClawHubPackageDetail({
+      name: parsed.name,
+      baseUrl: params.baseUrl,
+      token: params.token,
+      timeoutMs: params.timeoutMs,
+    });
+  } catch (error) {
+    return mapClawHubRequestError(error, {
+      stage: "package",
+      name: parsed.name,
+    });
+  }
+
+  const versionState = await resolveCompatiblePackageVersion({
+    detail,
+    requestedVersion: parsed.version,
+    baseUrl: params.baseUrl,
+    token: params.token,
+    timeoutMs: params.timeoutMs,
+  });
+  if (!versionState.ok) {
+    return versionState;
+  }
+
+  const runtimeVersion = resolveCompatibilityHostVersion(params.env);
+  const validationFailure = validateClawHubPluginPackage({
+    detail,
+    compatibility: versionState.compatibility,
+    runtimeVersion,
+  });
+  if (validationFailure) {
+    return validationFailure;
+  }
+
+  const runtimeIdResolution = resolveClawHubExpectedRuntimeId({
+    detail,
+    expectedPluginId: undefined,
+  });
+  if (!runtimeIdResolution.ok) {
+    return buildClawHubInstallFailure(runtimeIdResolution.error);
+  }
+
+  const canonicalPackageName = detail.package?.name ?? parsed.name;
+  const expectedClawPackSha256 = resolveClawHubClawPackArtifactSha256(versionState.clawpack);
+  if (!versionState.verification && !expectedClawPackSha256) {
+    return buildClawHubInstallFailure(
+      formatClawHubMissingArtifactMetadataError({
+        packageName: canonicalPackageName,
+        version: versionState.version,
+      }),
+      CLAWHUB_INSTALL_ERROR_CODE.ARTIFACT_UNAVAILABLE,
+    );
+  }
+
+  const clawpackSha256 = expectedClawPackSha256;
+  const archiveIntegrity =
+    versionState.verification?.kind === "archive-integrity"
+      ? versionState.verification.integrity
+      : null;
+  const npmIntegrity = resolveClawHubNpmIntegrity(versionState.clawpack);
+  const npmShasum = resolveClawHubNpmShasum(versionState.clawpack);
+  const officialClawHubPackage = detail.package
+    ? isDefaultOfficialClawHubPackage({ baseUrl: params.baseUrl, pkg: detail.package })
+    : false;
+
+  // Do not log summary or "Resolving" here (metadata probe only; install path owns logs).
+  const resolvedBaseUrl = resolveClawHubBaseUrl(params.baseUrl);
+
+  return {
+    ok: true,
+    packageName: canonicalPackageName,
+    version: versionState.version,
+    baseUrl: resolvedBaseUrl,
+    clawpackSha256,
+    archiveIntegrity,
+    npmIntegrity,
+    npmShasum,
+    officialClawHubPackage,
+    detail,
+  };
+}
+
+export type ClawHubReleaseMetadata = {
+  ok: true;
+  packageName: string;
+  version: string;
+  baseUrl: string;
+  clawpackSha256: string | null;
+  archiveIntegrity: string | null;
+  npmIntegrity: string | null;
+  npmShasum: string | null;
+  officialClawHubPackage: boolean;
+  detail: ClawHubPackageDetail;
+};
 
 export async function installPluginFromClawHub(
   params: InstallSafetyOverrides & {

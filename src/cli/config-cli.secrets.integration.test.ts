@@ -78,6 +78,35 @@ async function withExecDryRunConfigHarness(
 }
 
 describe("config cli secrets integration", () => {
+  it("rejects the trusted-plugin provenance marker on persisted manual exec providers", async () => {
+    const raw = `${JSON.stringify({ gateway: { port: 18789 } }, null, 2)}\n`;
+    await withConfigFileHarness(
+      "openclaw-config-cli-internal-provider-marker-",
+      raw,
+      async ({ configPath }) => {
+        const output = createTestRuntime();
+
+        await expect(
+          runConfigSet({
+            path: "secrets.providers.runner",
+            value: JSON.stringify({
+              source: "exec",
+              command: process.execPath,
+              _fromTrustedPluginIntegration: true,
+            }),
+            cliOptions: { strictJson: true },
+            runtime: output.runtime,
+          }),
+        ).rejects.toThrow("__exit__:1");
+
+        expect(fs.readFileSync(configPath, "utf8")).toBe(raw);
+        expect(output.errors.join("\n")).toContain(
+          "manual exec secret providers must not set the internal _fromTrustedPluginIntegration marker",
+        );
+      },
+    );
+  });
+
   it.each(["agents.defaults", "agents.entries.ops"])(
     "validates SecretRefs after normalizing model keys in %s",
     async (agentPath) => {

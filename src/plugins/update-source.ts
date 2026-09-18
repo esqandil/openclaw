@@ -1,10 +1,12 @@
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import type { PluginInstallRecord } from "../config/types.plugins.js";
+import { resolveClawHubBaseUrl } from "../infra/clawhub-client.js";
 import type { ClawHubTrustErrorCode } from "../infra/clawhub-install-trust.js";
 import {
   fetchClawHubPackageDetail,
   resolveLatestVersionFromPackage,
+  type ClawHubPackageDetail,
 } from "../infra/clawhub-packages.js";
 import { parseClawHubPluginSpec } from "../infra/clawhub-spec.js";
 import { unscopedPackageName } from "../infra/install-safe-path.js";
@@ -35,6 +37,7 @@ import {
   resolveOfficialExternalPluginInstall,
 } from "./official-external-plugin-catalog.js";
 import { satisfiesPluginApiRange, resolvePackagePluginApiRange } from "./package-compat.js";
+import { resolveRecordedClawHubPackage } from "./update-claw-lifecycle.js";
 
 /** Logger surface used by plugin update flows. */
 export type PluginUpdateLogger = {
@@ -173,6 +176,83 @@ export function shouldSkipUnchangedNpmInstall(params: {
   );
 }
 
+export function shouldSkipUnchangedClawHubInstall(params: {
+  currentVersion?: string;
+  record: PluginInstallRecord;
+  metadata: {
+    packageName: string;
+    version: string;
+    baseUrl: string;
+    clawpackSha256: string | null;
+    archiveIntegrity: string | null;
+    npmIntegrity?: string | null;
+    npmShasum?: string | null;
+  };
+}): boolean {
+  if (params.record.source !== "clawhub") {
+    return false;
+  }
+  const recordVersion = params.record.version;
+  if (!params.currentVersion || !recordVersion || !params.metadata.version) {
+    return false;
+  }
+  if (
+    params.currentVersion !== params.metadata.version ||
+    recordVersion !== params.metadata.version
+  ) {
+    return false;
+  }
+  const recordedPackage = resolveRecordedClawHubPackage(params.record);
+  if (!recordedPackage || recordedPackage !== params.metadata.packageName) {
+    return false;
+  }
+  // Architecture §5.2: record.clawhubUrl must be explicitly present (and normalize-equal to metadata.baseUrl).
+  // The normalizer resolves absent/blank to DEFAULT, which would allow false-positive unchanged
+  // skip for records that never recorded a registry identity. Guard before any normalization.
+  const recordClawhubUrl = params.record.clawhubUrl;
+  const metaBaseUrl = params.metadata.baseUrl;
+  if (
+    !recordClawhubUrl ||
+    typeof recordClawhubUrl !== "string" ||
+    !recordClawhubUrl.trim() ||
+    !metaBaseUrl ||
+    typeof metaBaseUrl !== "string" ||
+    !metaBaseUrl.trim()
+  ) {
+    return false;
+  }
+  const recordBase = resolveClawHubBaseUrl(recordClawhubUrl);
+  const metaBase = resolveClawHubBaseUrl(metaBaseUrl);
+  if (recordBase !== metaBase) {
+    return false;
+  }
+  // Strong artifact identity: prefer clawpackSha256 when present on both; else fall back to
+  // legacy archive-integrity on both sides when no clawpack present.
+  const clawpackMatch =
+    !!params.record.clawpackSha256 &&
+    !!params.metadata.clawpackSha256 &&
+    params.record.clawpackSha256 === params.metadata.clawpackSha256;
+  const archiveMatch =
+    !params.record.clawpackSha256 &&
+    !params.metadata.clawpackSha256 &&
+    !!params.record.integrity &&
+    !!params.metadata.archiveIntegrity &&
+    params.record.integrity === params.metadata.archiveIntegrity;
+  if (!clawpackMatch && !archiveMatch) {
+    return false;
+  }
+  // A record with neither clawpack nor integrity, or registry with neither, already returned false above.
+  // Defensive: npmIntegrity must match if both present (no shasum requirement here).
+  if (
+    params.record.npmIntegrity &&
+    params.metadata.npmIntegrity &&
+    params.record.npmIntegrity !== params.metadata.npmIntegrity
+  ) {
+    return false;
+  }
+  return true;
+}
+
 export function shouldBypassTrustedOfficialUnchangedNpmCheck(params: {
   metadata: NpmSpecResolution;
   spec: string;
@@ -275,6 +355,8 @@ export async function resolveNewerExactPinnedClawHubDefaultLine(params: {
   baseUrl?: string;
   updateChannel?: UpdateChannel;
   timeoutMs?: number;
+  /** Pre-fetched detail to avoid a second network round-trip from the unchanged gate. */
+  detail?: ClawHubPackageDetail;
 }): Promise<{ packageName: string; registryLine: "beta" | "latest"; version: string } | undefined> {
   if (!params.currentVersion || !params.probeClawHubVersion || !params.recordedSpec) {
     return undefined;
@@ -292,11 +374,14 @@ export async function resolveNewerExactPinnedClawHubDefaultLine(params: {
     return undefined;
   }
 
-  const detail = await fetchClawHubPackageDetail({
-    name: parsed.name,
-    baseUrl: params.baseUrl,
-    timeoutMs: params.timeoutMs,
-  }).catch(() => undefined);
+  let detail = params.detail;
+  if (!detail) {
+    detail = await fetchClawHubPackageDetail({
+      name: parsed.name,
+      baseUrl: params.baseUrl,
+      timeoutMs: params.timeoutMs,
+    }).catch(() => undefined);
+  }
   if (!detail?.package || detail.package.name !== parsed.name) {
     return undefined;
   }

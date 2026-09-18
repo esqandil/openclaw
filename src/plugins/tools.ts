@@ -31,9 +31,11 @@ import {
 } from "./manifest-contract-eligibility.js";
 import type { PluginManifestRecord } from "./manifest-registry.js";
 import { hasManifestToolAvailability } from "./manifest-tool-availability.js";
+import { adoptRuntimeMemoryRegistrations } from "./memory-state.js";
 import type { PluginMetadataManifestView } from "./plugin-metadata-snapshot.types.js";
 import { capturePluginLifecycleAuthority } from "./registry-lifecycle.js";
 import type { PluginRegistry, PluginToolRegistration } from "./registry-types.js";
+import { getActivePluginRegistry } from "./runtime.js";
 import {
   withPluginRuntimePluginScope,
   withPluginRuntimeRegistryScope,
@@ -93,15 +95,21 @@ function wrapPluginToolCallbacks(
   entry: PluginToolRegistration,
   pluginRegistry: PluginRegistry | undefined,
   tool: AnyAgentTool,
+  authorityRegistries?: readonly PluginRegistry[],
 ): AnyAgentTool {
   const record = pluginRegistry?.plugins.find((candidate) => candidate.id === entry.pluginId);
-  const authority = pluginRegistry
-    ? capturePluginLifecycleAuthority(pluginRegistry, record, { scopedRuntime: true })
-    : undefined;
+  // An adopted view is lookup scope, not a new lifetime. Its tool source and
+  // borrowed memory donor must both remain live when a retained callback runs.
+  const authorities = (authorityRegistries ?? (pluginRegistry ? [pluginRegistry] : [])).map(
+    (registry, index) =>
+      capturePluginLifecycleAuthority(registry, index === 0 ? record : undefined, {
+        scopedRuntime: true,
+      }),
+  );
   // Direct SDK contributions can lack records. Capture that choice once so a
   // removed record never falls back to registry authority or rebinds on publication.
   const runScoped = <T>(run: () => T): T => {
-    if (!authority?.()) {
+    if (authorities.length === 0 || authorities.some((authority) => !authority?.())) {
       throw new Error(`Plugin "${entry.pluginId}" tool runtime is no longer active.`);
     }
     return runWithPluginToolScope(entry, pluginRegistry, run);
@@ -165,22 +173,28 @@ function wrapPluginToolFactoryResult(
   entry: PluginToolRegistration,
   pluginRegistry: PluginRegistry | undefined,
   result: PluginToolFactoryResult,
+  authorityRegistries?: readonly PluginRegistry[],
 ): PluginToolFactoryResult {
   if (Array.isArray(result)) {
     return result.map((tool) =>
-      isAgentTool(tool) ? wrapPluginToolCallbacks(entry, pluginRegistry, tool) : tool,
+      isAgentTool(tool)
+        ? wrapPluginToolCallbacks(entry, pluginRegistry, tool, authorityRegistries)
+        : tool,
     );
   }
-  return isAgentTool(result) ? wrapPluginToolCallbacks(entry, pluginRegistry, result) : result;
+  return isAgentTool(result)
+    ? wrapPluginToolCallbacks(entry, pluginRegistry, result, authorityRegistries)
+    : result;
 }
 
 function resolvePluginToolFactory(
   entry: PluginToolRegistration,
   pluginRegistry: PluginRegistry | undefined,
   ctx: OpenClawPluginToolContext,
+  authorityRegistries?: readonly PluginRegistry[],
 ) {
   return runWithPluginToolScope(entry, pluginRegistry, () =>
-    wrapPluginToolFactoryResult(entry, pluginRegistry, entry.factory(ctx)),
+    wrapPluginToolFactoryResult(entry, pluginRegistry, entry.factory(ctx), authorityRegistries),
   );
 }
 
@@ -357,6 +371,7 @@ function createPluginToolFactoryTiming(params: {
 function resolvePluginToolFactoryEntry(params: {
   entry: PluginToolRegistration;
   pluginRegistry: PluginRegistry | undefined;
+  authorityRegistries?: readonly PluginRegistry[];
   ctx: OpenClawPluginToolContext;
   declaredNames: string[];
   factoryTimingStartedAt: number;
@@ -371,7 +386,12 @@ function resolvePluginToolFactoryEntry(params: {
   const factoryStartedAt = Date.now();
 
   try {
-    resolved = resolvePluginToolFactory(params.entry, params.pluginRegistry, params.ctx);
+    resolved = resolvePluginToolFactory(
+      params.entry,
+      params.pluginRegistry,
+      params.ctx,
+      params.authorityRegistries,
+    );
   } catch (err) {
     failed = true;
     // Suppress the resolver-side log only for invalid-config errors whose
@@ -611,15 +631,18 @@ function resolvePluginToolRegistry(params: {
   loadOptions: PluginLoadOptions;
   onlyPluginIds?: readonly string[];
   runtimeRegistry?: PluginRegistry;
-  manifestPlugins?: PluginMetadataManifestView["plugins"];
-}) {
+  manifestPlugins: PluginMetadataManifestView["plugins"];
+}): {
+  registry: PluginRegistry;
+  authorityRegistries?: readonly [source: PluginRegistry, donor: PluginRegistry];
+} {
   const requestedPluginIds = params.onlyPluginIds;
   // Tools belong to the prepared generation, even when
   // process-global discovery would select a different registry.
   if (
     registryHasScopedPluginTools(params.runtimeRegistry, requestedPluginIds, params.manifestPlugins)
   ) {
-    return params.runtimeRegistry;
+    return { registry: params.runtimeRegistry };
   }
   const activeRegistry = getLoadedRuntimePluginRegistry({
     loadOptions: params.loadOptions,
@@ -627,14 +650,31 @@ function resolvePluginToolRegistry(params: {
     requiredPluginIds: requestedPluginIds,
   });
   if (registryHasScopedPluginTools(activeRegistry, requestedPluginIds)) {
-    return activeRegistry;
+    return { registry: activeRegistry };
   }
   const registry = loadPluginRegistryHandle({
     ...params.loadOptions,
     activate: false,
     ...(requestedPluginIds === undefined ? {} : { onlyPluginIds: [...requestedPluginIds] }),
   });
-  return registry;
+  const donor = getActivePluginRegistry();
+  const config = params.loadOptions.activationSourceConfig ?? params.loadOptions.config;
+  if (!donor || !config) {
+    return { registry };
+  }
+  // A broader tool catalog can force a cold registry after agent-side adoption.
+  // Carry only eligible root sidecars; do not expand the tool discovery scope.
+  // The tool-only registry omits sidecar owners, so current metadata must still
+  // rule out a root owner shadowed by another source in this workspace.
+  const matchingDonor = createRuntimePluginManifestLookup(donor, params.manifestPlugins);
+  const adopted = adoptRuntimeMemoryRegistrations(
+    registry,
+    { ...donor, plugins: donor.plugins.filter((plugin) => matchingDonor(plugin.id)) },
+    config,
+  );
+  return adopted === registry
+    ? { registry }
+    : { registry: adopted, authorityRegistries: [registry, donor] };
 }
 
 function registryHasScopedPluginTools(
@@ -749,10 +789,14 @@ export function ensureStandalonePluginToolRegistryLoaded(params: {
   if (registryHasScopedPluginTools(registry, loadState.onlyPluginIds)) {
     return registry;
   }
-  return resolvePluginToolRegistry({
+  const resolved = resolvePluginToolRegistry({
     loadOptions: loadState.loadOptions,
     onlyPluginIds: loadState.onlyPluginIds,
+    manifestPlugins: loadState.snapshot.plugins,
   });
+  // Inventory callers borrow an owned source, never an adopted lookup view
+  // whose extra callback authorities would be lost on a later prepared fast path.
+  return resolved.authorityRegistries?.[0] ?? resolved.registry;
 }
 
 type PluginToolResolutionParams = {
@@ -809,19 +853,20 @@ export function resolvePluginTools(params: PluginToolResolutionParams): AnyAgent
     loadState.context === params.preparedRuntime?.loadContext
       ? params.preparedRuntime.registry
       : params.runtimeRegistry;
-  const registry = resolvePluginToolRegistry({
+  const { registry, authorityRegistries } = resolvePluginToolRegistry({
     loadOptions: loadState.loadOptions,
     onlyPluginIds: loadState.onlyPluginIds,
     runtimeRegistry,
     manifestPlugins: loadState.snapshot.plugins,
   });
-  return resolvePluginToolsFromRegistry(params, loadState, registry);
+  return resolvePluginToolsFromRegistry(params, loadState, registry, authorityRegistries);
 }
 
 function resolvePluginToolsFromRegistry(
   params: PluginToolResolutionParams,
   loadState: PluginToolLoadState,
   registry: PluginRegistry | undefined,
+  authorityRegistries?: readonly PluginRegistry[],
 ): AnyAgentTool[] {
   const { context, env, onlyPluginIds, allowlist, snapshot } = loadState;
   const tools: AnyAgentTool[] = [];
@@ -933,6 +978,7 @@ function resolvePluginToolsFromRegistry(
     const factoryResult = resolvePluginToolFactoryEntry({
       entry,
       pluginRegistry: registry,
+      authorityRegistries,
       ctx: params.context,
       declaredNames,
       factoryTimingStartedAt,

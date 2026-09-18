@@ -251,6 +251,45 @@ describe("update plugin lifecycle lease boundaries", () => {
     });
   });
 
+  it("does not require fresh Doctor for a replaced core whose plugin snapshot is unchanged", async () => {
+    vi.mocked(updatePluginsAfterCoreUpdate).mockResolvedValueOnce({
+      ...successfulPluginUpdate,
+      changed: false,
+    });
+
+    const result = await convergeUpdatePlugins({
+      coreAlreadyCurrent: false,
+      result: {
+        status: "ok",
+        mode: "npm",
+        root: "/tmp/openclaw",
+        reason: "updated",
+        before: { version: "2026.9.3" },
+        after: { version: "2026.9.4" },
+        steps: [],
+        durationMs: 1,
+      },
+      root: "/tmp/openclaw",
+      installKindChanged: false,
+      configSnapshot: validConfigSnapshot,
+      requestedChannel: null,
+      storedChannel: null,
+      channel: "stable",
+      downgradeRisk: false,
+      opts: {},
+      preUpdatePluginInstallRecords: {},
+      startedAt: 1,
+      updateStepTimeoutMs: 1_000,
+    });
+
+    expect(completePostCorePluginUpdate).toHaveBeenCalledWith(
+      expect.objectContaining({ freshDoctorRequired: false }),
+    );
+    expect(result.resultWithPostUpdate).toMatchObject({
+      status: "ok",
+    });
+  });
+
   it.each(["copied", "live"] as const)(
     "preserves the %s invocation environment through a failed phase",
     async (source) => {

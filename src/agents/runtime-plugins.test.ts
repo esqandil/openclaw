@@ -8,8 +8,11 @@ const hoisted = vi.hoisted(() => ({
   getActivePluginRegistryWorkspaceDir: vi.fn(),
   getActivePluginRuntimeSubagentMode: vi.fn(),
   loadPluginRegistryHandle: vi.fn(),
+  acquirePluginRegistryForInspection: vi.fn(),
+  getPluginRegistryInspectionResources: vi.fn(),
   adoptRuntimeContextEngineRegistrations: vi.fn((target: unknown) => target),
   adoptRuntimeWidgetPresenterRegistrations: vi.fn((target: unknown) => target),
+  adoptRuntimeMemoryRegistrations: vi.fn((target: unknown) => target),
   resolveAgentRuntimePluginLoadPlan: vi.fn(),
   resolveAgentRuntimePluginSelections: vi.fn(
     (_config: unknown, selections: readonly unknown[]) => selections,
@@ -31,6 +34,10 @@ vi.mock("../plugins/widget-presenters.js", () => ({
   adoptRuntimeWidgetPresenterRegistrations: hoisted.adoptRuntimeWidgetPresenterRegistrations,
 }));
 
+vi.mock("../plugins/memory-state.js", () => ({
+  adoptRuntimeMemoryRegistrations: hoisted.adoptRuntimeMemoryRegistrations,
+}));
+
 vi.mock("../plugins/plugin-metadata-snapshot.js", () => ({
   loadPluginMetadataSnapshot: hoisted.loadPluginMetadataSnapshot,
 }));
@@ -42,7 +49,16 @@ vi.mock("../plugins/current-plugin-metadata-snapshot.js", async (importOriginal)
 
 vi.mock("../plugins/loader.js", () => ({
   loadPluginRegistryHandle: hoisted.loadPluginRegistryHandle,
+  acquirePluginRegistryForInspection: hoisted.acquirePluginRegistryForInspection,
 }));
+
+vi.mock("../plugins/registry-inspection-resources.js", async (importOriginal) => {
+  const orig = await importOriginal<typeof import("../plugins/registry-inspection-resources.js")>();
+  return {
+    ...orig,
+    getPluginRegistryInspectionResources: hoisted.getPluginRegistryInspectionResources,
+  };
+});
 
 vi.mock("./harness/runtime-plugin-load-plan.js", () => ({
   resolveAgentHarnessOwnerPluginIds: hoisted.resolveAgentHarnessOwnerPluginIds,
@@ -60,6 +76,7 @@ import {
   resolvePluginRuntimeArtifactSelection,
 } from "../plugins/plugin-runtime-artifact-selection.js";
 import { createEmptyPluginRegistry } from "../plugins/registry-empty.js";
+import { PluginRegistryInspectionResources } from "../plugins/registry-inspection-resources.js";
 import {
   getPluginRuntimeGatewayRequestScope,
   withPluginRuntimeRegistryScope,
@@ -72,6 +89,7 @@ import {
   prepareWorkspacePluginRegistries,
 } from "./prepared-model-runtime.inbound-registry.js";
 import {
+  acquireAgentRuntimePluginRegistry,
   loadAgentRuntimePluginRegistryHandle,
   withAgentPluginRegistry,
 } from "./runtime-plugins.js";
@@ -102,12 +120,18 @@ describe("agent runtime plugin registries", () => {
     hoisted.getActivePluginRegistryWorkspaceDir.mockReset().mockReturnValue(undefined);
     hoisted.getActivePluginRuntimeSubagentMode.mockReset().mockReturnValue("default");
     hoisted.loadPluginRegistryHandle.mockReset().mockReturnValue({ handle: true });
+    hoisted.acquirePluginRegistryForInspection.mockReset().mockResolvedValue({
+      registry: { handle: "acquired" },
+      release: vi.fn(),
+    });
+    hoisted.getPluginRegistryInspectionResources.mockReset().mockReturnValue(null);
     hoisted.adoptRuntimeContextEngineRegistrations
       .mockReset()
       .mockImplementation((target) => target);
     hoisted.adoptRuntimeWidgetPresenterRegistrations
       .mockReset()
       .mockImplementation((target) => target);
+    hoisted.adoptRuntimeMemoryRegistrations.mockReset().mockImplementation((target) => target);
     hoisted.resolveAgentRuntimePluginLoadPlan.mockReset().mockImplementation(({ config }) => ({
       config,
       pluginIds: ["codex", "memory-core"],
@@ -130,18 +154,21 @@ describe("agent runtime plugin registries", () => {
     const primaryRegistry = createEmptyPluginRegistry();
     const contextEnginesAdopted = { handle: "context-engines" };
     const presentersAdopted = { handle: "presenters" };
+    const memoryAdopted = { handle: "memory" };
     const onPrimaryRegistry = vi.fn();
     hoisted.loadPluginRegistryHandle.mockReturnValue(primaryRegistry);
     hoisted.getActivePluginRegistry.mockReturnValue(activeRegistry);
     hoisted.adoptRuntimeContextEngineRegistrations.mockReturnValue(contextEnginesAdopted);
     hoisted.adoptRuntimeWidgetPresenterRegistrations.mockReturnValue(presentersAdopted);
+    hoisted.adoptRuntimeMemoryRegistrations.mockReturnValue(memoryAdopted);
 
+    const testConfig = { plugins: { enabled: true } } as never;
     expect(
       loadAgentRuntimePluginRegistryHandle(
-        { config: {}, workspaceDir: "/tmp/workspace" },
+        { config: testConfig, workspaceDir: "/tmp/workspace" },
         onPrimaryRegistry,
       ),
-    ).toBe(presentersAdopted);
+    ).toBe(memoryAdopted);
     expect(onPrimaryRegistry).toHaveBeenCalledExactlyOnceWith(primaryRegistry);
     expect(hoisted.adoptRuntimeContextEngineRegistrations).toHaveBeenCalledWith(
       primaryRegistry,
@@ -151,9 +178,90 @@ describe("agent runtime plugin registries", () => {
       contextEnginesAdopted,
       activeRegistry,
     );
+    expect(hoisted.adoptRuntimeMemoryRegistrations).toHaveBeenCalledWith(
+      presentersAdopted,
+      activeRegistry,
+      testConfig,
+    );
     expect(hoisted.loadPluginRegistryHandle).toHaveBeenCalledWith(
       expect.not.objectContaining({ onlyPluginIds: expect.anything() }),
     );
+  });
+
+  it("acquire and load handle adopt memory corpus/prompt/prep when config present and retain donor; no config skips memory", async () => {
+    const activeRegistry = createEmptyPluginRegistry();
+    const primaryRegistry = createEmptyPluginRegistry();
+    const contextAdopted = { handle: "ctx" };
+    const widgetAdopted = { handle: "widget" };
+    const memoryAdopted = { handle: "memory-adopted" };
+    hoisted.getActivePluginRegistry.mockReturnValue(activeRegistry);
+    hoisted.adoptRuntimeContextEngineRegistrations.mockReturnValue(contextAdopted);
+    hoisted.adoptRuntimeWidgetPresenterRegistrations.mockReturnValue(widgetAdopted);
+    hoisted.adoptRuntimeMemoryRegistrations.mockReturnValue(memoryAdopted);
+
+    // Use real PluginRegistryInspectionResources from ../plugins/registry-inspection-resources.js.
+    // Attach one resource owner to primaryRegistry and one to activeRegistry before mocking acquire.
+    const primaryResources = new PluginRegistryInspectionResources();
+    primaryResources.attach(primaryRegistry);
+    const activeResources = new PluginRegistryInspectionResources();
+    activeResources.attach(activeRegistry);
+
+    hoisted.getPluginRegistryInspectionResources.mockImplementation((reg: any) =>
+      reg === primaryRegistry ? primaryResources : reg === activeRegistry ? activeResources : null,
+    );
+
+    // Return release bound to the primary resources.
+    hoisted.acquirePluginRegistryForInspection.mockResolvedValue({
+      registry: primaryRegistry,
+      release: () => primaryResources.release(),
+    });
+
+    // with config: adopts memory, donor set, assert coversSource, release cleanly
+    const cfg = { plugins: {} } as never;
+    const acquired = await acquireAgentRuntimePluginRegistry({
+      config: cfg,
+      workspaceDir: "/tmp/ws",
+    });
+    expect("resources" in acquired).toBe(true);
+    if (!("resources" in acquired)) {
+      throw new Error("expected resources in acquired");
+    }
+    expect(acquired.registry).toBe(memoryAdopted);
+    expect(acquired.primaryRegistry).toBe(primaryRegistry);
+    expect(acquired.resources).toBe(primaryResources);
+    expect(acquired.resources.coversSource(activeResources)).toBe(true);
+    await acquired.releaseRegistry();
+
+    // no config: skips memory adoption. Preserve no-config behavior. Use fresh resources.
+    hoisted.adoptRuntimeMemoryRegistrations.mockClear();
+    const primaryResources2 = new PluginRegistryInspectionResources();
+    primaryResources2.attach(primaryRegistry);
+    const activeResources2 = new PluginRegistryInspectionResources();
+    activeResources2.attach(activeRegistry);
+    hoisted.getPluginRegistryInspectionResources.mockImplementation((reg: any) =>
+      reg === primaryRegistry
+        ? primaryResources2
+        : reg === activeRegistry
+          ? activeResources2
+          : null,
+    );
+    hoisted.acquirePluginRegistryForInspection.mockResolvedValue({
+      registry: primaryRegistry,
+      release: () => primaryResources2.release(),
+    });
+    const acquiredNoCfg = await acquireAgentRuntimePluginRegistry({ workspaceDir: "/tmp/ws" });
+    expect(hoisted.adoptRuntimeMemoryRegistrations).not.toHaveBeenCalled();
+    expect("releaseRegistry" in acquiredNoCfg).toBe(true);
+    if (!("releaseRegistry" in acquiredNoCfg)) {
+      throw new Error("expected releaseRegistry in acquiredNoCfg");
+    }
+    expect(acquiredNoCfg.primaryRegistry).toBe(primaryRegistry);
+    await acquiredNoCfg.releaseRegistry();
+
+    // load handle no-config also skips
+    hoisted.adoptRuntimeMemoryRegistrations.mockClear();
+    loadAgentRuntimePluginRegistryHandle({ workspaceDir: "/tmp/ws" });
+    expect(hoisted.adoptRuntimeMemoryRegistrations).not.toHaveBeenCalled();
   });
 
   it("uses harness runtimes prepared by the lifecycle batch", () => {

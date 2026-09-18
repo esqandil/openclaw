@@ -67,6 +67,26 @@ type PackageDoctorOptions = {
   onConfigSnapshot?: (snapshot: UpdateConfigSnapshot) => void;
 };
 
+export type PackagePostInstallDoctorPolicy = "run" | "defer-live-managed-gateway";
+
+const DEFERRED_LIVE_GATEWAY_DOCTOR_MESSAGE =
+  "The on-disk OpenClaw update is installed, but --no-restart left the running managed Gateway untouched; runtime activation is not claimed. At the next maintenance window, have the service owner stop the Gateway, run `openclaw doctor --fix`, then restart it. Restart and Doctor repair remain pending.";
+
+export function createDeferredLiveGatewayDoctorStep(root: string): UpdateStepResult {
+  return {
+    name: `${CLI_NAME} doctor (deferred)`,
+    command: `${CLI_NAME} doctor --fix`,
+    cwd: root,
+    durationMs: 0,
+    exitCode: 0,
+    advisory: {
+      kind: "package-post-install-doctor",
+      message: DEFERRED_LIVE_GATEWAY_DOCTOR_MESSAGE,
+    },
+    warnings: [DEFERRED_LIVE_GATEWAY_DOCTOR_MESSAGE],
+  };
+}
+
 export async function runPackageUpdateDoctor(params: PackageDoctorOptions) {
   const entryPath = await resolveGatewayInstallEntrypoint(params.root);
   if (!entryPath) {
@@ -222,6 +242,7 @@ export type PackageInstallUpdateParams = {
   beforeActivate: () => Promise<void>;
   onTransaction: (transaction: PackageUpdateTransaction) => void;
   onConfigSnapshot?: PackageDoctorOptions["onConfigSnapshot"];
+  postInstallDoctorPolicy?: PackagePostInstallDoctorPolicy;
 };
 
 export async function runPackageInstallUpdate(
@@ -288,7 +309,10 @@ export async function runPackageInstallUpdate(
         ...stepParams,
         progress: params.progress,
       }),
-    postVerifyStep: (root: string) => runPackageUpdateDoctor({ ...params, root }),
+    postVerifyStep: (root: string) =>
+      params.postInstallDoctorPolicy === "defer-live-managed-gateway"
+        ? Promise.resolve(createDeferredLiveGatewayDoctorStep(root))
+        : runPackageUpdateDoctor({ ...params, root }),
   });
 
   const afterBuildId = packageUpdate.activePackageRoot

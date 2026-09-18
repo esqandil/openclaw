@@ -14,6 +14,7 @@ import {
   type PluginCapabilityConsentHandler,
 } from "./capability-consent.js";
 import { buildClawHubPluginInstallRecordFields } from "./clawhub-install-records.js";
+import { resolveClawHubReleaseMetadata } from "./clawhub.js";
 import { normalizePluginsConfig, resolveEffectiveEnableState } from "./config-state.js";
 import {
   NpmChannelResolutionError,
@@ -72,6 +73,7 @@ import {
   resolveNpmUpdateTarget,
   resolveTrustedOfficialPrereleaseFallbackMetadataForUpdate,
   shouldBypassTrustedOfficialUnchangedNpmCheck,
+  shouldSkipUnchangedClawHubInstall,
   shouldSkipUnchangedNpmInstall,
   type PluginUpdateChannelFallback,
   type PluginUpdateIntegrityDriftParams,
@@ -85,7 +87,7 @@ import {
   recordPluginUpdateFailure,
   recordPluginUpdateTransaction,
 } from "./update-summary.js";
-import { reconcileUnchangedUpdate } from "./update-unchanged.js";
+import { reconcileUnchangedUpdate, reconcileUnchangedClawHubUpdate } from "./update-unchanged.js";
 
 export async function updateNpmInstalledPlugins(params: {
   config: OpenClawConfig;
@@ -366,6 +368,57 @@ export async function updateNpmInstalledPlugins(params: {
       pluginId,
       installPath,
     });
+
+    // Narrow ClawHub unchanged gate (applies to dry-run AND real modes).
+    // Metadata-only resolver (no download/extract/install/trust). Fail-closed to existing path on any
+    // identity mismatch, missing fields, payload problem or broken host peer link.
+    // Preserves all Doctor, capability, policy, trust, rollback, restart and missing-payload paths.
+    if (record.source === "clawhub" && currentVersion && installedManifest) {
+      const metaSpec =
+        effectiveSpec ?? (recordClawHubPackage ? `clawhub:${recordClawHubPackage}` : record.spec);
+      let metadataResult: Awaited<ReturnType<typeof resolveClawHubReleaseMetadata>> | undefined;
+      try {
+        metadataResult = await resolveClawHubReleaseMetadata({
+          spec: metaSpec ?? `clawhub:${pluginId}`,
+          baseUrl: record.clawhubUrl,
+          timeoutMs: params.timeoutMs,
+        });
+      } catch {
+        // Resolver threw (network, parse, etc.): fall through to existing installer path.
+        metadataResult = undefined;
+      }
+      if (metadataResult && metadataResult.ok) {
+        if (
+          shouldSkipUnchangedClawHubInstall({
+            currentVersion,
+            record,
+            metadata: metadataResult,
+          }) &&
+          (await hasRunnableInstalledNpmPayload({ installPath, manifest: installedManifest })) &&
+          !(await auditDeclaredOpenClawHostDependency({
+            packageDir: installPath,
+            packageName: recordClawHubPackage ?? pluginId,
+          }))
+        ) {
+          const unchanged = await reconcileUnchangedClawHubUpdate({
+            config: next,
+            pluginId,
+            record,
+            currentVersion,
+            metadata: metadataResult,
+            updateChannel,
+            timeoutMs: params.timeoutMs,
+            hasSpecOverride: Boolean(params.specOverrides?.[pluginId]),
+          });
+          next = unchanged.config;
+          changed ||= unchanged.changed;
+          outcomes.push(unchanged.outcome);
+          completedCanonicalUpdates.add(pluginId);
+          continue;
+        }
+      }
+      // !ok or !skip: fall through to preparePluginUpdateCapabilityConsent + run attempt (existing behaviour)
+    }
 
     if (
       !params.dryRun &&
