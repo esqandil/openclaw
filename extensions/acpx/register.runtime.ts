@@ -5,6 +5,7 @@
 import {
   getAcpRuntimeBackend,
   registerAcpRuntimeBackend,
+  requireAcpRuntimeBackend,
   unregisterAcpRuntimeBackend,
 } from "openclaw/plugin-sdk/acp-runtime-backend";
 import type { OpenClawPluginService, OpenClawPluginServiceContext } from "openclaw/plugin-sdk/core";
@@ -17,15 +18,18 @@ type RealAcpxServiceModule = typeof import("./src/service.js");
 type InnerAcpxRuntimeServiceParams = NonNullable<
   Parameters<RealAcpxServiceModule["createAcpxRuntimeService"]>[0]
 >;
-type CreateAcpxRuntimeServiceParams = Omit<InnerAcpxRuntimeServiceParams, "backendLifecycle">;
+type CreateAcpxRuntimeServiceParams = Omit<
+  InnerAcpxRuntimeServiceParams,
+  "backendLifecycle" | "probeAtStartup" | "startupPurpose" | "assertCurrent"
+>;
 
 type DeferredServiceState = {
   ctx: OpenClawPluginServiceContext | null;
+  published: boolean;
   lifecycleRevision: number;
   ownedRuntime: CompleteAcpRuntime | null;
   params: CreateAcpxRuntimeServiceParams;
-  realRuntime: CompleteAcpRuntime | null;
-  realService: OpenClawPluginService | null;
+  realService: ReturnType<RealAcpxServiceModule["createAcpxRuntimeService"]> | null;
   startPromise: Promise<CompleteAcpRuntime> | null;
   stopPromise: Promise<void> | null;
 };
@@ -42,39 +46,60 @@ async function startRealService(
   state: DeferredServiceState,
   lifecycleRevision: number,
   deferredRuntime: CompleteAcpRuntime,
+  purpose: "gateway" | "inspection" = "gateway",
+  probeAtStartup = purpose === "gateway",
 ): Promise<CompleteAcpRuntime> {
   if (state.lifecycleRevision !== lifecycleRevision || !state.ctx) {
     throw new Error("ACPX runtime service is not started");
-  }
-  if (state.realRuntime) {
-    return state.realRuntime;
   }
   if (state.startPromise) {
     return await state.startPromise;
   }
   const ctx = state.ctx;
+  let starting = true;
   state.startPromise = (async () => {
     let publishedRuntime: CompleteAcpRuntime | null = null;
     const { createAcpxRuntimeService: createAcpxRuntimeServiceLocal } = await loadServiceModule();
     const service = createAcpxRuntimeServiceLocal({
       ...state.params,
+      probeAtStartup,
+      startupPurpose: purpose,
+      assertCurrent: () => {
+        if (
+          state.lifecycleRevision !== lifecycleRevision ||
+          state.ctx !== ctx ||
+          (state.published && getAcpRuntimeBackend(ACPX_BACKEND_ID)?.runtime !== state.ownedRuntime)
+        ) {
+          throw new Error("ACPX runtime service lost recovery ownership");
+        }
+      },
       backendLifecycle: {
         publish(backend) {
           if (state.lifecycleRevision !== lifecycleRevision || state.ctx !== ctx) {
             throw new Error("ACPX runtime service stopped during activation");
           }
-          if (getAcpRuntimeBackend(ACPX_BACKEND_ID)?.runtime !== deferredRuntime) {
+          if (
+            state.published &&
+            getAcpRuntimeBackend(ACPX_BACKEND_ID)?.runtime !== deferredRuntime
+          ) {
             throw new Error("ACPX runtime service lost registry ownership during activation");
           }
           // Publication is a synchronous compare-and-replace: another plugin
           // generation cannot be adopted between the ownership check and write.
-          registerAcpRuntimeBackend({ id: ACPX_BACKEND_ID, ...backend });
+          if (state.published) {
+            const { healthy } = backend;
+            registerAcpRuntimeBackend({
+              id: ACPX_BACKEND_ID,
+              ...backend,
+              runtime: deferredRuntime,
+              // The facade can accept callers while they share the bounded startup probe.
+              ...(healthy ? { healthy: () => starting || healthy() } : {}),
+            });
+          }
           publishedRuntime = backend.runtime;
-          state.ownedRuntime = backend.runtime;
         },
-        retract(runtime) {
-          unregisterOwnedRuntime(runtime);
-        },
+        // The outer service owns the stable facade and retracts it before inner cleanup.
+        retract() {},
       },
     });
     state.realService = service;
@@ -85,14 +110,15 @@ async function startRealService(
     if (!publishedRuntime) {
       throw new Error("ACPX runtime service did not register an ACP backend");
     }
-    if (getAcpRuntimeBackend(ACPX_BACKEND_ID)?.runtime !== publishedRuntime) {
+    if (state.published && getAcpRuntimeBackend(ACPX_BACKEND_ID)?.runtime !== deferredRuntime) {
       throw new Error("ACPX runtime service lost registry ownership during activation");
     }
     // Registry publication intentionally precedes the startup probe, but callers
     // must keep sharing the start promise until the inner service is fully ready.
-    state.realRuntime = publishedRuntime;
     return publishedRuntime;
-  })();
+  })().finally(() => {
+    starting = false;
+  });
   try {
     return await state.startPromise;
   } catch (error) {
@@ -108,22 +134,29 @@ function createDeferredRuntime(
   state: DeferredServiceState,
   lifecycleRevision: number,
 ): CompleteAcpRuntime {
-  const deferredRuntime: CompleteAcpRuntime = createLazyAcpRuntimeProxy(
-    (): Promise<CompleteAcpRuntime> => startRealService(state, lifecycleRevision, deferredRuntime),
-  );
+  const deferredRuntime: CompleteAcpRuntime = {
+    ...createLazyAcpRuntimeProxy(() => startRealService(state, lifecycleRevision, deferredRuntime)),
+    async ensureSession(input) {
+      const runtime = await startRealService(state, lifecycleRevision, deferredRuntime);
+      // Recheck the published health after startup; doctor must remain available for recovery.
+      requireAcpRuntimeBackend(ACPX_BACKEND_ID);
+      return await runtime.ensureSession(input);
+    },
+  };
   return deferredRuntime;
 }
 
-/** Creates the plugin service that registers ACPX as an ACP runtime backend. */
 export function createAcpxRuntimeService(
   params: CreateAcpxRuntimeServiceParams = {},
-): OpenClawPluginService {
+): OpenClawPluginService & {
+  getRuntime: (ctx: OpenClawPluginServiceContext) => Promise<CompleteAcpRuntime>;
+} {
   const state: DeferredServiceState = {
     ctx: null,
+    published: false,
     lifecycleRevision: 0,
     ownedRuntime: null,
     params,
-    realRuntime: null,
     realService: null,
     startPromise: null,
     stopPromise: null,
@@ -131,6 +164,26 @@ export function createAcpxRuntimeService(
 
   return {
     id: "acpx-runtime",
+    async getRuntime(ctx) {
+      if (state.stopPromise) {
+        await state.stopPromise;
+      }
+      if (!state.ctx) {
+        state.ctx = ctx;
+        state.lifecycleRevision += 1;
+        state.ownedRuntime = createDeferredRuntime(state, state.lifecycleRevision);
+      }
+      if (!state.ownedRuntime) {
+        throw new Error("ACPX runtime service lost its runtime owner");
+      }
+      return await startRealService(
+        state,
+        state.lifecycleRevision,
+        state.ownedRuntime,
+        state.published ? "gateway" : "inspection",
+        false,
+      );
+    },
     async start(ctx) {
       if (process.env.OPENCLAW_SKIP_ACPX_RUNTIME === "1") {
         ctx.logger.info("skipping embedded acpx runtime backend (OPENCLAW_SKIP_ACPX_RUNTIME=1)");
@@ -140,6 +193,28 @@ export function createAcpxRuntimeService(
         await state.stopPromise;
       }
 
+      if (state.ctx && state.ownedRuntime) {
+        const revision = state.lifecycleRevision;
+        const previous = getAcpRuntimeBackend(ACPX_BACKEND_ID)?.runtime;
+        const assertCurrent = () => {
+          const current = getAcpRuntimeBackend(ACPX_BACKEND_ID)?.runtime;
+          if (
+            state.lifecycleRevision !== revision ||
+            !state.ctx ||
+            (current !== previous && current !== state.ownedRuntime)
+          ) {
+            throw new Error("ACPX runtime service lost promotion ownership");
+          }
+        };
+        await state.startPromise;
+        assertCurrent();
+        await state.realService?.promote(ctx, assertCurrent);
+        assertCurrent();
+        state.published = true;
+        registerAcpRuntimeBackend({ id: ACPX_BACKEND_ID, runtime: state.ownedRuntime });
+        return;
+      }
+      state.published = true;
       state.lifecycleRevision += 1;
       const lifecycleRevision = state.lifecycleRevision;
       state.ctx = ctx;
@@ -160,6 +235,7 @@ export function createAcpxRuntimeService(
       // service still owns cleanup, but it can no longer become the active runtime.
       state.lifecycleRevision += 1;
       state.ctx = null;
+      state.published = false;
       const ownedRuntime = state.ownedRuntime;
       unregisterOwnedRuntime(ownedRuntime);
       const startPromise = state.startPromise;
@@ -170,7 +246,6 @@ export function createAcpxRuntimeService(
         } finally {
           unregisterOwnedRuntime(ownedRuntime);
           state.ownedRuntime = null;
-          state.realRuntime = null;
           state.realService = null;
           state.startPromise = null;
         }

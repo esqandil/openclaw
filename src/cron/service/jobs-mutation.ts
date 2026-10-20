@@ -2,9 +2,10 @@
 import { isDeepStrictEqual } from "node:util";
 import { isCronJobActive } from "../active-jobs.js";
 import { cronSchedulingInputsEqual } from "../schedule-identity.js";
-import { createCronStreamSourceIdentity, cronStreamScheduleKey } from "../stream-schedule.js";
+import { reconcileCronSourceIdentity } from "../source-schedule.js";
 import type { CronJob, CronJobPatch, CronStoredJob } from "../types.js";
 import { computeJobNextRunAtMs, hasScheduledNextRunAtMs, isJobEnabled } from "./jobs-scheduling.js";
+import { resolveForcePreservedOneShotAtMs } from "./one-shot-schedule.js";
 
 /** Keep the harness-owned immutable envelope intact when copying mutable job fields. */
 export function cloneCronJobForMutation(job: CronStoredJob): CronStoredJob {
@@ -14,21 +15,6 @@ export function cloneCronJobForMutation(job: CronStoredJob): CronStoredJob {
   return { ...structuredClone(mutableJob), ...(runtimeAuthority ? { runtimeAuthority } : {}) };
 }
 
-function reconcileStreamSourceIdentity(job: CronJob, nextJob: CronJob): void {
-  if (nextJob.schedule.kind !== "stream") {
-    nextJob.state.streamSourceIdentity = undefined;
-    return;
-  }
-  const sourceChanged =
-    job.schedule.kind !== "stream" ||
-    cronStreamScheduleKey(job.schedule) !== cronStreamScheduleKey(nextJob.schedule) ||
-    isJobEnabled(job) !== isJobEnabled(nextJob);
-  const currentIdentity =
-    job.schedule.kind === "stream" ? job.state.streamSourceIdentity : undefined;
-  nextJob.state.streamSourceIdentity =
-    sourceChanged || !currentIdentity ? createCronStreamSourceIdentity() : currentIdentity;
-}
-
 export function finalizeUpdatedJob(params: {
   job: CronJob;
   nextJob: CronJob;
@@ -36,9 +22,10 @@ export function finalizeUpdatedJob(params: {
   schedulingInputsRequested: boolean;
   scheduleChanged: boolean;
   explicitTriggerState?: CronJobPatch["state"];
+  isJobActive?: (id: string) => boolean;
 }) {
   const { job, nextJob, now } = params;
-  if (nextJob.schedule.kind === "every") {
+  if (params.scheduleChanged && nextJob.schedule.kind === "every") {
     const anchor = nextJob.schedule.anchorMs;
     if (typeof anchor !== "number" || !Number.isFinite(anchor)) {
       // Inherit the previous cadence anchor only for an unchanged-interval
@@ -54,13 +41,7 @@ export function finalizeUpdatedJob(params: {
         Number.isFinite(job.schedule.anchorMs)
           ? job.schedule.anchorMs
           : undefined;
-      const fallbackAnchorMs =
-        previousAnchorMs ??
-        (params.scheduleChanged
-          ? now
-          : typeof nextJob.createdAtMs === "number" && Number.isFinite(nextJob.createdAtMs)
-            ? nextJob.createdAtMs
-            : now);
+      const fallbackAnchorMs = previousAnchorMs ?? now;
       nextJob.schedule = {
         ...nextJob.schedule,
         anchorMs: Math.max(0, Math.floor(fallbackAnchorMs)),
@@ -70,7 +51,7 @@ export function finalizeUpdatedJob(params: {
   // Source identity belongs to the durable job mutation, not the process
   // watcher. Equivalent resaves preserve it; disable/enable and source changes
   // rotate it in the same write that changes the public job definition.
-  reconcileStreamSourceIdentity(job, nextJob);
+  reconcileCronSourceIdentity(job, nextJob);
 
   const previousScript = job.payload.kind === "script" ? job.payload.script : undefined;
   const nextScript = nextJob.payload.kind === "script" ? nextJob.payload.script : undefined;
@@ -113,7 +94,13 @@ export function finalizeUpdatedJob(params: {
     // trigger mode that produced it. Configuration changes release both the
     // slot and its provenance so natural schedule math can take ownership.
     nextJob.state.pacedNextRunAtMs = undefined;
-    nextJob.state.forcePreservedNextRunAtMs = undefined;
+    // Enablement alone cannot consume a one-shot retained by manual verification.
+    nextJob.state.forcePreservedNextRunAtMs = cronSchedulingInputsEqual(
+      { ...job, enabled: nextJob.enabled },
+      nextJob,
+    )
+      ? resolveForcePreservedOneShotAtMs(job)
+      : undefined;
     if (isJobEnabled(nextJob)) {
       nextJob.state.nextRunAtMs = computeJobNextRunAtMs(nextJob, now);
     } else {
@@ -121,7 +108,7 @@ export function finalizeUpdatedJob(params: {
       nextJob.state.queuedAtMs = undefined;
       // Preserve only genuine execution. Queued reservations must clear so a
       // disabled job can accept a later force run with the same timestamp.
-      if (!isCronJobActive(nextJob.id)) {
+      if (!(params.isJobActive ?? isCronJobActive)(nextJob.id)) {
         Object.assign(nextJob.state, { runningAtMs: undefined, runningReceiptId: undefined });
         delete nextJob.state.runningScheduleChangeId;
       }

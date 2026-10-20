@@ -1,6 +1,17 @@
 import { isProxy } from "node:util/types";
 
-const deeplyFrozenPlainData = new WeakSet<object>();
+const MAX_FROZEN_PLAIN_DATA_ADMISSIONS = 256 * 1024;
+let deeplyFrozenPlainData = new WeakSet<object>();
+let frozenPlainDataAdmissions = 0;
+
+function boundFrozenPlainData(root: object): void {
+  // Dead weak keys can leave a large backing table behind. Evict only after the
+  // traversal finishes: trusted freezing also uses this set to stop cycles.
+  if (frozenPlainDataAdmissions > MAX_FROZEN_PLAIN_DATA_ADMISSIONS) {
+    deeplyFrozenPlainData = new WeakSet([root]);
+    frozenPlainDataAdmissions = 1;
+  }
+}
 
 function isPlainDataObject(value: object): boolean {
   if (isProxy(value)) {
@@ -14,86 +25,102 @@ function isPlainDataObject(value: object): boolean {
   );
 }
 
-/** Immutable graphs keep their classification for exactly as long as their objects live. */
-export function isDeeplyFrozenPlainData(value: unknown): boolean {
+function inspectPlainData(value: unknown, freeze: boolean, requireFrozen = true): boolean {
   if (!value || typeof value !== "object") {
     return typeof value !== "function";
   }
   if (deeplyFrozenPlainData.has(value)) {
     return true;
   }
+  if (!freeze && requireFrozen && (isProxy(value) || !Object.isFrozen(value))) {
+    return false;
+  }
+  let plain = true;
   const inspected = new Set<object>();
-  const visit = (candidate: unknown): boolean => {
-    if (!candidate || typeof candidate !== "object") {
-      return typeof candidate !== "function";
+  const pending = [value];
+  while (pending.length) {
+    const candidate = pending.pop()!;
+    if (inspected.has(candidate)) {
+      continue;
     }
-    if (deeplyFrozenPlainData.has(candidate) || inspected.has(candidate)) {
-      return true;
+    if (!isPlainDataObject(candidate)) {
+      if (!freeze) {
+        return false;
+      }
+      plain = false;
+      continue;
     }
-    if (!isPlainDataObject(candidate) || !Object.isFrozen(candidate)) {
+    if (!freeze && requireFrozen && !Object.isFrozen(candidate)) {
       return false;
     }
     inspected.add(candidate);
-    let firstChild: object | undefined;
-    let moreChildren: object[] | undefined;
+    // Direct members disprove the container before queued child graphs are inspected.
     for (const key of Reflect.ownKeys(candidate)) {
       const descriptor = Object.getOwnPropertyDescriptor(candidate, key)!;
-      if (!("value" in descriptor) || typeof descriptor.value === "function") {
-        return false;
-      }
-      if (descriptor.value && typeof descriptor.value === "object") {
-        if (firstChild === undefined) {
-          firstChild = descriptor.value;
-        } else {
-          (moreChildren ??= []).push(descriptor.value);
-        }
-      }
-    }
-    // Opaque members disprove the container before any child graph needs inspection.
-    if (firstChild && !visit(firstChild)) {
-      return false;
-    }
-    if (moreChildren) {
-      for (const child of moreChildren) {
-        if (!visit(child)) {
+      const member: unknown = descriptor.value;
+      if (!("value" in descriptor) || typeof member === "function") {
+        if (!freeze) {
           return false;
         }
+        plain = false;
+        continue;
+      }
+      if (member && typeof member === "object" && !deeplyFrozenPlainData.has(member)) {
+        pending.push(member);
       }
     }
-    return true;
-  };
-  if (!visit(value)) {
-    return false;
+    if (freeze) {
+      Object.freeze(candidate);
+    }
   }
   // A cycle is proven only when every reachable member passes, not on a back edge.
-  for (const candidate of inspected) {
-    deeplyFrozenPlainData.add(candidate);
+  if (plain && (freeze || requireFrozen)) {
+    for (const candidate of inspected) {
+      deeplyFrozenPlainData.add(candidate);
+    }
+    frozenPlainDataAdmissions += inspected.size;
+    boundFrozenPlainData(value);
   }
-  return true;
+  return plain;
+}
+
+/** Inspect mutable plain graphs without caching them or reading accessors. */
+export function isPlainData(value: unknown): boolean {
+  return inspectPlainData(value, false, false);
+}
+
+/** Memoized proofs use weak keys and can be evicted without changing graph immutability. */
+export function isDeeplyFrozenPlainData(value: unknown): boolean {
+  return inspectPlainData(value, false);
 }
 
 /** Freeze an owner's cloned JSON snapshot without executing opaque members. */
 export function freezeJsonSnapshot<T>(value: T): T {
-  const seen = new Set<object>();
-  const visit = (candidate: unknown) => {
-    if (
-      !candidate ||
-      typeof candidate !== "object" ||
-      seen.has(candidate) ||
-      deeplyFrozenPlainData.has(candidate) ||
-      !isPlainDataObject(candidate)
-    ) {
-      return;
-    }
-    seen.add(candidate);
-    for (const key of Reflect.ownKeys(candidate)) {
-      const descriptor = Object.getOwnPropertyDescriptor(candidate, key)!;
-      if ("value" in descriptor) {
-        visit(descriptor.value);
-      }
+  inspectPlainData(value, true);
+  return value;
+}
+
+/** Freeze decoded/internal JSON only; callers own the plain-data guarantee. */
+export function freezeTrustedJsonSnapshot<T>(value: T): T {
+  if (!value || typeof value !== "object" || deeplyFrozenPlainData.has(value)) {
+    return value;
+  }
+  const pending: object[] = [value];
+  while (pending.length) {
+    const candidate = pending.pop()!;
+    if (deeplyFrozenPlainData.has(candidate)) {
+      continue;
     }
     Object.freeze(candidate);
-  };
-  visit(value);
+    deeplyFrozenPlainData.add(candidate);
+    frozenPlainDataAdmissions++;
+    for (const key in candidate) {
+      const child: unknown = Reflect.get(candidate, key);
+      if (child && typeof child === "object") {
+        pending.push(child);
+      }
+    }
+  }
+  boundFrozenPlainData(value);
   return value;
 }

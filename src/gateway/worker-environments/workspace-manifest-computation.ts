@@ -1,4 +1,9 @@
+import type {
+  readActualWorkspaceManifestImpl,
+  readWorkspaceFileSnapshotWithLimit,
+} from "./workspace-actual-manifest.js";
 import type { WorkspaceHashMetrics } from "./workspace-hash-memo.js";
+import type { WorkspaceNode } from "./workspace-manifest-comparison.js";
 import type {
   WorkerWorkspaceManifest,
   WorkerWorkspaceManifestEntry,
@@ -19,35 +24,8 @@ export type WorkspaceComputationHashResult<T> = {
   metrics: WorkspaceHashMetrics;
 };
 
-type WorkspaceManifestCapture = {
-  manifest: WorkerWorkspaceManifest;
-  manifestRef: string;
-};
-
-type WorkspaceManifestSnapshot = WorkspaceManifestCapture & {
-  rawManifest: string;
-};
-
-type WorkspaceManifestComparison = {
-  changed: boolean;
-  entries: WorkerWorkspaceManifestEntry[];
-  paths: string[];
-};
-
-type WorkspaceManifestPair = {
-  base: WorkerWorkspaceManifest;
-  current: WorkerWorkspaceManifest;
-} & WorkspaceManifestComparison;
-
-type WorkspaceApplyPreflight = {
-  applyPaths: Set<string>;
-  conflictPaths: string[];
-  blockingConflictPaths: string[];
-};
-
-type WorkspaceFileSnapshot =
-  | { type: "file"; mode: number; size: number; sha256: string }
-  | { type: "unsupported" };
+type WorkspaceManifestSnapshot = Awaited<ReturnType<typeof readActualWorkspaceManifestImpl>>;
+type WorkspaceManifestCapture = Omit<WorkspaceManifestSnapshot, "rawManifest">;
 
 export type WorkspaceManifestValueInputs = {
   "workspace.manifest.capture": {
@@ -55,6 +33,7 @@ export type WorkspaceManifestValueInputs = {
     baseCommit: string | null;
     preserveDirectories?: readonly string[];
     includePaths?: readonly string[];
+    buildCacheInputs?: string[];
     hashes?: WorkspaceComputationHashes;
   };
   "workspace.manifest.snapshot": WorkspaceManifestValueInputs["workspace.manifest.capture"];
@@ -63,6 +42,17 @@ export type WorkspaceManifestValueInputs = {
     maxBytes: number;
     root?: string;
     hashes?: WorkspaceComputationHashes;
+  };
+  "workspace.manifest.nodes": {
+    root: string;
+    paths: string[];
+    hashes?: WorkspaceComputationHashes;
+  };
+  "workspace.manifest.tree-input": {
+    inputPath: string;
+    ref: string;
+    entries: readonly WorkerWorkspaceManifestEntry[];
+    source: { root: string; tree?: never } | { root: string; tree: string };
   };
   "workspace.manifest.serialize": { manifest: WorkerWorkspaceManifest };
   "workspace.manifest.overlay": {
@@ -78,27 +68,63 @@ export type WorkspaceManifestValueInputs = {
   };
 };
 
-type WorkspaceManifestValueInput = { payload: Uint8Array<ArrayBuffer> };
+export type WorkspaceStageInputSource<Raw = Uint8Array<ArrayBuffer>> =
+  | {
+      baseManifestRef: string;
+      currentManifestRef: string;
+      baseManifestRaw: Raw;
+      currentManifestRaw: Raw;
+    }
+  | {
+      publication: {
+        metadata: Raw;
+        publicationDigest: string;
+        currentManifestRef: string;
+        baseCommit: string;
+      };
+    };
+
+export type WorkspaceStageInput<Raw = Uint8Array<ArrayBuffer>> = WorkspaceStageInputSource<Raw> & {
+  inputPath: string;
+  stagingRoot: string;
+  stagedResultRef: string;
+  buildCacheInputs?: string[];
+};
+
+export type WorkspaceManifestValueOutputs = {
+  "workspace.manifest.capture": WorkspaceComputationHashResult<WorkspaceManifestCapture>;
+  "workspace.manifest.snapshot": WorkspaceComputationHashResult<WorkspaceManifestSnapshot>;
+  "workspace.manifest.file": WorkspaceComputationHashResult<
+    Awaited<ReturnType<typeof readWorkspaceFileSnapshotWithLimit>>
+  >;
+  "workspace.manifest.nodes": WorkspaceComputationHashResult<Array<[string, WorkspaceNode]>>;
+  "workspace.manifest.tree-input": null;
+  "workspace.manifest.serialize": { raw: string; manifestRef: string };
+  "workspace.manifest.overlay": WorkspaceManifestCapture;
+  "workspace.reconcile.preflight": WorkspaceComputationHashResult<{
+    applyPaths: Set<string>;
+    conflictPaths: string[];
+    blockingConflictPaths: string[];
+  }>;
+};
 
 export type WorkspaceManifestComputationOperations = {
-  "workspace.manifest.capture": {
-    input: WorkspaceManifestValueInput;
-    output: WorkspaceComputationHashResult<WorkspaceManifestCapture>;
+  [Type in keyof WorkspaceManifestValueInputs]: {
+    input: { payload: Uint8Array<ArrayBuffer> };
+    output: WorkspaceManifestValueOutputs[Type];
   };
-  "workspace.manifest.snapshot": {
-    input: WorkspaceManifestValueInput;
-    output: WorkspaceComputationHashResult<WorkspaceManifestSnapshot>;
+} & {
+  "workspace.manifest.remote-capture": {
+    input: {
+      argv: string[];
+      home: string;
+      memo?: string;
+      maxHashMemoBytes: number;
+    };
+    output: string;
   };
   "workspace.manifest.parse": {
     input: { raw: Uint8Array<ArrayBuffer>; expectedRef?: string };
-    output: { manifest: WorkerWorkspaceManifest; manifestRef: string };
-  };
-  "workspace.manifest.serialize": {
-    input: WorkspaceManifestValueInput;
-    output: { raw: string; manifestRef: string };
-  };
-  "workspace.manifest.overlay": {
-    input: WorkspaceManifestValueInput;
     output: { manifest: WorkerWorkspaceManifest; manifestRef: string };
   };
   "workspace.manifest.pair": {
@@ -108,18 +134,16 @@ export type WorkspaceManifestComputationOperations = {
       currentRaw: Uint8Array<ArrayBuffer>;
       currentRef: string;
     };
-    output: WorkspaceManifestPair;
-  };
-  "workspace.reconcile.preflight": {
-    input: WorkspaceManifestValueInput;
-    output: WorkspaceComputationHashResult<WorkspaceApplyPreflight>;
-  };
-  "workspace.manifest.file": {
-    input: WorkspaceManifestValueInput;
-    output: WorkspaceComputationHashResult<WorkspaceFileSnapshot>;
+    output: {
+      base: WorkerWorkspaceManifest;
+      current: WorkerWorkspaceManifest;
+      changed: boolean;
+      entries: WorkerWorkspaceManifestEntry[];
+      paths: string[];
+    };
   };
   "workspace.manifest.staged": {
-    input: { root: string; ref: string };
+    input: { root: string; ref: string; buildCacheInputs?: string[] };
     output: StagedWorkerWorkspaceInventory;
   };
   "workspace.manifest.entries": {
@@ -130,15 +154,8 @@ export type WorkspaceManifestComputationOperations = {
     output: Uint8Array;
   };
   "workspace.manifest.stage-input": {
-    input: {
-      stagingRoot: string;
-      stagedResultRef: string;
-      baseManifestRef: string;
-      currentManifestRef: string;
-      baseManifestRaw: Uint8Array<ArrayBuffer>;
-      currentManifestRaw: Uint8Array<ArrayBuffer>;
-    };
-    output: Uint8Array;
+    input: WorkspaceStageInput;
+    output: null;
   };
 };
 

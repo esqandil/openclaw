@@ -1,6 +1,8 @@
 import { decodeMountInfoPath } from "@openclaw/normalization-core/mountinfo-path";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
+import { root as openFsSafeRoot } from "../../infra/fs-safe.js";
 import { isPathInside } from "../../infra/path-guards.js";
+import { MATERIALIZED_SANDBOX_SKILLS_WORKSPACE } from "../../shared/sandbox-workspace-paths.js";
 import { splitSandboxBindSpec } from "./bind-spec.js";
 import { execContainer, type SandboxContainerEngine } from "./container-engine.js";
 import {
@@ -30,6 +32,8 @@ export type SandboxMountPlan = {
 export async function prepareSandboxMountPlan(params: {
   engine: SandboxContainerEngine;
   workspaceDir: string;
+  workspaceSource?: "managed-worktree";
+  assertCurrent?: () => void;
   agentWorkspaceDir: string;
   skillsWorkspaceDir?: string;
   workdir: string;
@@ -40,6 +44,22 @@ export async function prepareSandboxMountPlan(params: {
 }): Promise<SandboxMountPlan> {
   const selection = resolveSandboxMountSelection(params);
   const namespace = await resolveDockerSourceNamespace(params.engine);
+  const relativeSkillMount = `${MATERIALIZED_SANDBOX_SKILLS_WORKSPACE}/skills`;
+  const skillTarget = normalizeMountContainerPath(`${params.workdir}/${relativeSkillMount}`);
+  if (
+    params.workspaceSource === "managed-worktree" &&
+    selection.readOnlyWorkspaceSkillMounts.some((mount) => mount.containerPath === skillTarget)
+  ) {
+    // Engine-created nested mountpoints can be owned by a different user namespace.
+    // Allocate the empty scaffold as its workspace owner before mounting read-only
+    // instructions, so normal workspace retention can later remove it without chmod.
+    const workspace = await openFsSafeRoot(params.workspaceDir, {
+      mode: 0o755,
+      mutationSymlinks: "reject",
+      assertBeforeMutation: params.assertCurrent,
+    });
+    await workspace.mkdir(relativeSkillMount);
+  }
   const allowedRoots = [
     params.workspaceDir,
     params.agentWorkspaceDir,
@@ -119,8 +139,11 @@ type ContainerMountInfo = {
 export async function resolveSandboxContainerOnlyMounts(params: {
   engine: SandboxContainerEngine;
   containerName: string;
+  assertCurrent?: () => void;
 }): Promise<string[]> {
+  params.assertCurrent?.();
   const inspected = await inspectSandboxMounts(params);
+  params.assertCurrent?.();
   const { stdout } = await execContainer(
     params.engine,
     ["exec", params.containerName, "cat", "/proc/self/mountinfo"],
@@ -262,4 +285,72 @@ export async function sandboxMountPlanMatchesContainer(params: {
       );
     })
   );
+}
+
+/** Read saved workspace bytes only when the existing runtime exposes that same bind. */
+export async function sandboxContainerShowsWorkspacePaths(params: {
+  engine: SandboxContainerEngine;
+  containerName: string;
+  workspaceDir: string;
+  containerRoot: string;
+  targets: readonly string[];
+  assertCurrent: () => void;
+}): Promise<boolean> {
+  params.assertCurrent();
+  const identity = await execContainer(
+    params.engine,
+    ["inspect", "-f", "{{.Id}} {{.State.Running}} {{.State.Paused}}", params.containerName],
+    { signal: AbortSignal.timeout(5_000) },
+  );
+  params.assertCurrent();
+  const [id, running, paused] = identity.stdout.trim().split(/\s+/u);
+  if (
+    !id ||
+    !/^[a-f0-9]{64}$/u.test(id) ||
+    !["true", "false"].includes(running ?? "") ||
+    paused !== "false"
+  ) {
+    return false;
+  }
+  const selected = { ...params, containerName: id };
+  const namespace = await resolveDockerSourceNamespace(params.engine);
+  params.assertCurrent();
+  const planned = namespace
+    ? translateSandboxMountSources({
+        source: params.workspaceDir,
+        containerPath: params.containerRoot,
+        allowedRoots: [params.workspaceDir],
+        mounts: namespace,
+        readOnly: true,
+        shadowedTargets: [],
+      })
+    : [
+        {
+          hostPath: params.workspaceDir,
+          containerPath: normalizeMountContainerPath(params.containerRoot),
+        },
+      ];
+  const actual = await inspectSandboxMounts(selected);
+  params.assertCurrent();
+  // Stopped containers retain inspectable bind/volume metadata. Runtime-only
+  // mounts no longer exist; a running namespace additionally needs mountinfo.
+  const masks = running === "true" ? await resolveSandboxContainerOnlyMounts(selected) : [];
+  params.assertCurrent();
+  return params.targets.every((input) => {
+    const target = normalizeMountContainerPath(input);
+    const covering = actual
+      .filter((mount) => isPathInsideContainerRoot(mount.destination, target))
+      .toSorted((a, b) => b.destination.length - a.destination.length)[0];
+    const expected = planned.find((mount) => mount.containerPath === covering?.destination);
+    return (
+      covering?.type === "bind" &&
+      expected !== undefined &&
+      getSandboxHostPathPolicyKey(covering.source) ===
+        getSandboxHostPathPolicyKey(expected.hostPath) &&
+      !masks.some(
+        (mask) =>
+          isPathInsideContainerRoot(mask, target) && mask.length >= covering.destination.length,
+      )
+    );
+  });
 }
