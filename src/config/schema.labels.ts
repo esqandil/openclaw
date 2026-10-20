@@ -1,4 +1,5 @@
 import { MEDIA_AUDIO_FIELD_LABELS } from "./media-audio-field-metadata.js";
+import { MEMORY_SEARCH_FIELD_LABELS } from "./memory-search-field-metadata.js";
 import { GATEWAY_FIELD_LABELS } from "./schema.gateway-labels.js";
 import { AGENT_MODEL_FIELD_LABELS } from "./schema.labels.agent-models.js";
 import { APPROVAL_FIELD_LABELS } from "./schema.labels.approvals.js";
@@ -8,7 +9,6 @@ import { GITHUB_TOOL_FIELD_LABELS } from "./schema.labels.github.js";
 import { MESSAGE_FIELD_LABELS } from "./schema.labels.messages.js";
 import { SESSION_FIELD_LABELS } from "./schema.labels.session.js";
 import { WORKSPACE_FIELD_LABELS } from "./schema.labels.workspace.js";
-import { MEMORY_SEARCH_FIELD_LABELS } from "./memory-search-field-metadata.js";
 import { META_FIELD_LABELS } from "./schema.meta.js";
 import { NODE_CAPABILITY_FIELD_LABELS } from "./schema.node-capabilities.js";
 import { CLOUD_WORKER_FIELD_LABELS } from "./zod-schema.cloud-workers.js";
