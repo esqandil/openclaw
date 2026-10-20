@@ -466,7 +466,12 @@ filesystem modification time ages. The option disables temporal decay for matchi
 files while leaving semantic/keyword relevance, trust, provenance, and automatic-injection
 eligibility unchanged. It does not override date-based decay for canonical `memory/YYYY-MM-DD*.md`
 daily notes. If duplicate entries use the same path and pattern, the last entry's `evergreen` value
-wins.
+wins. Changing only this flag changes query-time ranking; it does not rebuild the index or
+re-embed unchanged content.
+
+Before downgrading to a version that does not support `evergreen`, remove that property from
+every global and per-agent `extraPaths` object. Older strict configuration schemas reject the
+unknown property, including `evergreen: false`; removing it restores the older decay policy.
 
 For shared notes, keep each workspace's `memory/` directory local and add the shared directory's
 canonical path to `extraPaths`. This setting indexes notes; it does not authorize legacy host-event

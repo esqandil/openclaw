@@ -148,20 +148,19 @@ describe("config schema regressions", () => {
     ).toBe(true);
   });
 
-  it("accepts mixed extra memory path entries", () => {
-    expect(
-      validateConfigObject({
-        memory: {
-          search: {
-            extraPaths: [
-              "../team-notes",
-              { path: "../shared", pattern: "runbooks/**/*.md", evergreen: true },
-            ],
-          },
-        },
-        agents: { defaults: {} },
-      }).ok,
-    ).toBe(true);
+  it("accepts and preserves mixed extra memory path entries", () => {
+    const extraPaths = [
+      "../team-notes",
+      { path: "../shared", pattern: "runbooks/**/*.md", evergreen: true },
+    ];
+    const result = validateConfigObject({
+      memory: { search: { extraPaths } },
+      agents: { defaults: {} },
+    });
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.config.memory?.search?.extraPaths).toEqual(extraPaths);
+    }
   });
 
   it.each([
@@ -170,12 +169,16 @@ describe("config schema regressions", () => {
     { path: "../shared", evergreen: "yes" },
     { path: "../shared", name: "legacy-qmd-name" },
   ])("rejects invalid extra memory path object %j", (entry) => {
-    expect(
-      validateConfigObject({
-        memory: { search: { extraPaths: [entry] } },
-        agents: { defaults: {} },
-      }).ok,
-    ).toBe(false);
+    const result = validateConfigObject({
+      memory: { search: { extraPaths: [entry] } },
+      agents: { defaults: {} },
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.issues.some((issue) => issue.path.startsWith("memory.search.extraPaths"))).toBe(
+        true,
+      );
+    }
   });
 
   it("rejects local memorySearch GPU policy", () => {

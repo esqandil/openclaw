@@ -372,7 +372,7 @@ describe("memory reindex state", () => {
     ).toBe(true);
   });
 
-  it("does not rebuild the index when only extra-path recency policy changes", () => {
+  it("keeps scope identity stable when only extra-path recency policy changes", () => {
     const workspaceDir = "/tmp/workspace";
     const multimodal = {
       enabled: false,
