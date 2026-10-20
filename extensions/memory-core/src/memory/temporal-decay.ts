@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import type { ResolvedMemorySearchConfig } from "openclaw/plugin-sdk/memory-core-host-engine-foundation";
 import { isPathInside } from "openclaw/plugin-sdk/file-access-runtime";
+import type { ResolvedMemorySearchConfig } from "openclaw/plugin-sdk/memory-core-host-engine-foundation";
 import {
   matchesExtraMemoryPathEntry,
   normalizeExtraMemoryPathEntries,
@@ -46,9 +46,10 @@ async function extractTimestamp(params: {
   const absolutePath = params.workspaceDir
     ? path.resolve(params.workspaceDir, params.filePath)
     : undefined;
-  const canonicalPath = absolutePath && params.workspaceDir
-    ? path.relative(params.workspaceDir, absolutePath).replaceAll("\\", "/").replace(/^\.\//, "")
-    : normalized;
+  const canonicalPath =
+    absolutePath && params.workspaceDir
+      ? path.relative(params.workspaceDir, absolutePath).replaceAll("\\", "/").replace(/^\.\//, "")
+      : normalized;
   const isCanonicalMemoryPath =
     canonicalPath === "MEMORY.md" ||
     canonicalPath === "USER.md" ||

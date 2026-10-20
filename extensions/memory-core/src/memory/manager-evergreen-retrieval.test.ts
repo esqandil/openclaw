@@ -1,9 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import {
-  requireNodeSqlite,
-  type ResolvedMemorySearchConfig,
-} from "openclaw/plugin-sdk/memory-core-host-engine-storage";
+import type { ResolvedMemorySearchConfig } from "openclaw/plugin-sdk/memory-core-host-engine-foundation";
+import { requireNodeSqlite } from "openclaw/plugin-sdk/memory-core-host-engine-storage";
 import { describe, expect, it } from "vitest";
 import { createManagerIndexFixture } from "./manager-index.test-support.js";
 import type { MemoryIndexManager } from "./manager.js";
@@ -119,6 +117,9 @@ describe("evergreen reference retrieval", () => {
         const selected = resultFor(results, "reference/stable.md");
         if (evergreen) {
           expect(selected.score).toBeGreaterThan(stable.score * 3);
+          expect(results.indexOf(selected)).toBeLessThan(
+            results.indexOf(resultFor(results, "reference/decaying.md")),
+          );
           expect(selected.score, JSON.stringify(results)).toBeGreaterThan(
             resultFor(results, "reference/decaying.md").score * 3,
           );

@@ -1,4 +1,7 @@
-import type { MemoryEntryProvenance, MemoryExtraPath } from "openclaw/plugin-sdk/memory-core-host-engine-storage";
+import type {
+  MemoryEntryProvenance,
+  MemoryExtraPath,
+} from "openclaw/plugin-sdk/memory-core-host-engine-storage";
 import { applyMMRToHybridResults, type MMRConfig } from "./mmr.js";
 import {
   applyRetrievalRanking,

@@ -52,7 +52,6 @@ describe("config schema regressions", () => {
     }
   });
 
-
   it.each([["ops"], ["ops-*"], [], ["*"]].map((send) => ({ send })))(
     "accepts per-agent send destinations $send",
     ({ send }) => {
